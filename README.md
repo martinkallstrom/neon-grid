@@ -7,6 +7,7 @@ Agent-first turn-based cyberpunk tactics game.
 - Single `server.js` file
 - Node built-ins only
 - Browser spectator/player UI at `/`
+- Human play UI at `/human`
 - Agent-friendly JSON state at `/state`
 - Action submission endpoint for bots and humans
 

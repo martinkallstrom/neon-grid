@@ -99,6 +99,10 @@ function route(req, res) {
     return html(res, page());
   }
 
+  if (req.method === "GET" && url.pathname === "/human") {
+    return html(res, humanPage());
+  }
+
   if (req.method === "GET" && url.pathname === "/state") {
     return json(res, 200, publicState());
   }
@@ -1002,6 +1006,382 @@ function page() {
         dumpEl.textContent = JSON.stringify(state, null, 2);
         draw(state);
       }
+
+      resetEl.addEventListener("click", async () => {
+        await api("/reset", { method: "POST" });
+        await refresh();
+      });
+
+      refresh();
+      setInterval(refresh, 1500);
+    </script>
+  </body>
+</html>`;
+}
+
+function humanPage() {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NEON GRID Human Console</title>
+    <style>
+      :root {
+        --bg: #050711;
+        --panel: rgba(10, 16, 30, 0.94);
+        --border: rgba(111, 134, 196, 0.18);
+        --text: #e4eeff;
+        --muted: #96a7cf;
+        --cyan: #00f5ff;
+        --magenta: #ff4fd8;
+        --green: #5cff87;
+        --amber: #ffd166;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(0,245,255,0.12), transparent 28%),
+          radial-gradient(circle at bottom right, rgba(255,79,216,0.14), transparent 30%),
+          linear-gradient(180deg, #050711 0%, #090f1d 100%);
+      }
+      main {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 20px 14px 40px;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 7vw, 3.4rem);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .lede {
+        margin: 8px 0 18px;
+        color: var(--muted);
+      }
+      .layout {
+        display: grid;
+        gap: 16px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 14px;
+      }
+      .statusbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .pill {
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 7px 10px;
+        font-size: 0.82rem;
+        color: var(--muted);
+        background: rgba(12, 18, 34, 0.9);
+      }
+      canvas {
+        width: 100%;
+        aspect-ratio: 1;
+        display: block;
+        border-radius: 14px;
+        background: linear-gradient(180deg, #0d1527 0%, #0a1221 100%);
+      }
+      .controls {
+        display: grid;
+        gap: 12px;
+      }
+      .picker {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .picker button {
+        padding: 14px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(17, 27, 47, 0.92);
+        color: var(--text);
+        font: inherit;
+        cursor: pointer;
+      }
+      .picker button.active[data-player="gpt"] {
+        background: linear-gradient(135deg, rgba(0,245,255,0.25), rgba(0,245,255,0.12));
+        border-color: rgba(0,245,255,0.4);
+      }
+      .picker button.active[data-player="claude"] {
+        background: linear-gradient(135deg, rgba(255,79,216,0.26), rgba(255,79,216,0.12));
+        border-color: rgba(255,79,216,0.42);
+      }
+      .dpad {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        align-items: stretch;
+      }
+      .dpad button,
+      .row button,
+      #reset {
+        border: 0;
+        border-radius: 14px;
+        padding: 16px 12px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .move {
+        background: linear-gradient(135deg, #91fbff, var(--cyan));
+        color: #07121c;
+      }
+      .act {
+        background: linear-gradient(135deg, #d5ffe0, var(--green));
+        color: #08150e;
+      }
+      .warn {
+        background: linear-gradient(135deg, #ffe6a6, var(--amber));
+        color: #1c1307;
+      }
+      .ghost {
+        background: rgba(17, 27, 47, 0.92);
+        color: var(--text);
+        border: 1px solid var(--border);
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 10px;
+      }
+      .player-cards {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(12, 18, 34, 0.86);
+      }
+      .card strong {
+        display: inline-block;
+        margin-bottom: 6px;
+      }
+      .log {
+        display: grid;
+        gap: 8px;
+        max-height: 240px;
+        overflow: auto;
+      }
+      .entry {
+        border-left: 3px solid rgba(111, 134, 196, 0.22);
+        padding-left: 10px;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      @media (max-width: 720px) {
+        .player-cards,
+        .picker {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Neon Grid</h1>
+      <p class="lede">Human mode. Pick a side, tap an action, and the engine resolves the turn when both operators lock in.</p>
+
+      <section class="layout">
+        <article class="panel">
+          <div class="statusbar" id="status"></div>
+          <canvas id="board" width="720" height="720"></canvas>
+        </article>
+
+        <article class="panel controls">
+          <div class="picker" id="picker">
+            <button data-player="gpt">Play As GPT</button>
+            <button data-player="claude">Play As Claude</button>
+          </div>
+          <div class="hint" id="selectionHint">Selected player: GPT</div>
+          <div class="dpad">
+            <div></div>
+            <button class="move" data-type="move" data-direction="north">North</button>
+            <div></div>
+            <button class="move" data-type="move" data-direction="west">West</button>
+            <button class="act" data-type="capture">Capture</button>
+            <button class="move" data-type="move" data-direction="east">East</button>
+            <div></div>
+            <button class="move" data-type="move" data-direction="south">South</button>
+            <div></div>
+          </div>
+          <div class="row">
+            <button class="warn" data-type="hack">Hack</button>
+            <button class="ghost" data-type="wait">Wait</button>
+            <button class="ghost" id="reset">Reset</button>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="player-cards" id="players"></div>
+        </article>
+
+        <article class="panel">
+          <div class="log" id="log"></div>
+        </article>
+      </section>
+    </main>
+    <script>
+      const canvas = document.getElementById("board");
+      const ctx = canvas.getContext("2d");
+      const statusEl = document.getElementById("status");
+      const pickerEl = document.getElementById("picker");
+      const hintEl = document.getElementById("selectionHint");
+      const playersEl = document.getElementById("players");
+      const logEl = document.getElementById("log");
+      const resetEl = document.getElementById("reset");
+      let selectedPlayer = "gpt";
+      let latestState = null;
+
+      async function api(path, options) {
+        const response = await fetch(path, options);
+        return response.json();
+      }
+
+      function cell(state) {
+        return canvas.width / state.grid.width;
+      }
+
+      function draw(state) {
+        const size = cell(state);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#0c1526";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.strokeStyle = "rgba(80,102,151,0.38)";
+        ctx.lineWidth = 1;
+        for (let x = 0; x <= state.grid.width; x++) {
+          ctx.beginPath();
+          ctx.moveTo(x * size, 0);
+          ctx.lineTo(x * size, canvas.height);
+          ctx.stroke();
+        }
+        for (let y = 0; y <= state.grid.height; y++) {
+          ctx.beginPath();
+          ctx.moveTo(0, y * size);
+          ctx.lineTo(canvas.width, y * size);
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = "#253455";
+        for (const [x, y] of state.grid.walls) {
+          ctx.fillRect(x * size + 4, y * size + 4, size - 8, size - 8);
+        }
+
+        for (const node of state.nodes) {
+          const owner = node.owner ? state.players[node.owner] : null;
+          ctx.fillStyle = owner ? owner.color : "#ffd166";
+          ctx.beginPath();
+          ctx.arc(node.x * size + size / 2, node.y * size + size / 2, size * 0.22, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = owner ? owner.accent : "rgba(255,209,102,0.45)";
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+
+        for (const player of Object.values(state.players)) {
+          ctx.globalAlpha = player.alive ? 1 : 0.3;
+          ctx.fillStyle = player.color;
+          ctx.fillRect(player.pos.x * size + 10, player.pos.y * size + 10, size - 20, size - 20);
+          ctx.strokeStyle = player.id === selectedPlayer ? "#ffffff" : player.accent;
+          ctx.lineWidth = player.id === selectedPlayer ? 4 : 2;
+          ctx.strokeRect(player.pos.x * size + 10, player.pos.y * size + 10, size - 20, size - 20);
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      function renderStatus(state) {
+        const winner = state.winnerIds.length
+          ? "Winner: " + state.winnerIds.map((id) => state.players[id].label).join(", ")
+          : "Winner: pending";
+        statusEl.innerHTML = [
+          "<span class=\\"pill\\">Turn " + state.turn + " / " + state.maxTurns + "</span>",
+          "<span class=\\"pill\\">Phase: " + state.phase + "</span>",
+          "<span class=\\"pill\\">Queued: " + Object.keys(state.pendingActions).length + "</span>",
+          "<span class=\\"pill\\">" + winner + "</span>"
+        ].join("");
+      }
+
+      function renderPlayers(state) {
+        playersEl.innerHTML = Object.values(state.players).map((player) => {
+          const pending = state.pendingActions[player.id];
+          return "<div class=\\"card\\">" +
+            "<strong style=\\"color:" + player.color + "\\">" + player.label + "</strong><br>" +
+            "Position: (" + player.pos.x + ", " + player.pos.y + ")<br>" +
+            "HP: " + player.hp + " / " + player.maxHp + "<br>" +
+            "Nodes: " + player.capturedNodes + "<br>" +
+            "Respawn: " + player.respawnIn + "<br>" +
+            "Queued: " + (pending ? pending.type + (pending.direction ? " " + pending.direction : "") : "none") +
+          "</div>";
+        }).join("");
+      }
+
+      function renderLog(state) {
+        logEl.innerHTML = state.log.slice().reverse().map((entry) => {
+          return "<div class=\\"entry\\"><strong>T" + entry.turn + "</strong> " + entry.summary + "</div>";
+        }).join("");
+      }
+
+      function updateSelection() {
+        pickerEl.querySelectorAll("button").forEach((button) => {
+          button.classList.toggle("active", button.dataset.player === selectedPlayer);
+        });
+        hintEl.textContent = "Selected player: " + selectedPlayer.toUpperCase();
+      }
+
+      async function refresh() {
+        latestState = await api("/state");
+        renderStatus(latestState);
+        renderPlayers(latestState);
+        renderLog(latestState);
+        draw(latestState);
+        updateSelection();
+      }
+
+      pickerEl.querySelectorAll("button").forEach((button) => {
+        button.addEventListener("click", () => {
+          selectedPlayer = button.dataset.player;
+          updateSelection();
+          if (latestState) draw(latestState);
+        });
+      });
+
+      document.querySelectorAll("[data-type]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          if (!latestState) return;
+          const payload = {
+            player: selectedPlayer,
+            type: button.dataset.type,
+            direction: button.dataset.direction || null,
+            turn: latestState.turn
+          };
+          await api("/action", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          await refresh();
+        });
+      });
 
       resetEl.addEventListener("click", async () => {
         await api("/reset", { method: "POST" });

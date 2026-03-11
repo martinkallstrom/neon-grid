@@ -74,3 +74,11 @@ npm start
 ```
 
 Then open `http://localhost:3000`.
+
+## Bot
+
+Example GPT bot client:
+
+```bash
+node bot-gpt.js http://localhost:3000
+```

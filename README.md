@@ -15,12 +15,14 @@ Agent-first turn-based cyberpunk tactics game.
 
 - 12x12 grid with fixed walls
 - 2 players for v1: `gpt` and `claude`
-- 4 capture nodes
+- 5 capture nodes
+- Center node is worth double
 - Simultaneous turn resolution
 - Actions: `move`, `hack`, `capture`, `wait`
 - `hack` damages adjacent enemies for 1 HP
 - Players have 3 HP and respawn after missing 1 turn
 - Match ends after 30 turns
+- Ties break on total damage dealt
 
 ## API
 

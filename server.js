@@ -34,10 +34,11 @@ const WALLS = [
   [1, 8], [10, 3]
 ];
 const NODE_POSITIONS = [
-  { id: "n1", x: 2, y: 2 },
-  { id: "n2", x: 9, y: 2 },
-  { id: "n3", x: 2, y: 9 },
-  { id: "n4", x: 9, y: 9 }
+  { id: "n1", x: 2, y: 2, value: 1 },
+  { id: "n2", x: 9, y: 2, value: 1 },
+  { id: "n3", x: 2, y: 9, value: 1 },
+  { id: "n4", x: 9, y: 9, value: 1 },
+  { id: "core", x: 6, y: 4, value: 2 }
 ];
 
 let state = createInitialState();
@@ -57,6 +58,8 @@ function createInitialState() {
       maxHp: 3,
       respawnIn: 0,
       capturedNodes: 0,
+      score: 0,
+      damageDealt: 0,
       alive: true,
       lastAction: null
     };
@@ -376,7 +379,7 @@ function resolveCaptures(turn, actions, actionableIds) {
       turn,
       playerId: id,
       type: "capture",
-      summary: `${player.label} captured node ${node.id}`
+      summary: `${player.label} captured node ${node.id}${node.value > 1 ? ` (+${node.value})` : ""}`
     });
   }
 }
@@ -406,6 +409,7 @@ function resolveHacks(turn, actions, actionableIds) {
 
     for (const targetId of targets) {
       damage[targetId] = (damage[targetId] || 0) + 1;
+      state.players[id].damageDealt += 1;
       appendLog({
         turn,
         playerId: id,
@@ -509,23 +513,31 @@ function findSpawn(preferred) {
 
 function finishGame() {
   updateCapturedNodeCounts();
-  const scores = PLAYER_ORDER.map((id) => state.players[id].capturedNodes);
-  const best = Math.max(...scores);
-  state.winnerIds = PLAYER_ORDER.filter((id) => state.players[id].capturedNodes === best);
+  const bestScore = Math.max(...PLAYER_ORDER.map((id) => state.players[id].score));
+  let contenders = PLAYER_ORDER.filter((id) => state.players[id].score === bestScore);
+  if (contenders.length > 1) {
+    const bestDamage = Math.max(...contenders.map((id) => state.players[id].damageDealt));
+    contenders = contenders.filter((id) => state.players[id].damageDealt === bestDamage);
+  }
+  state.winnerIds = contenders;
   state.phase = "game_over";
+  const summary = state.winnerIds.length === 1
+    ? `${state.players[state.winnerIds[0]].label} wins the grid`
+    : "The grid ended in a draw";
   appendLog({
     turn: state.turn,
     playerId: "system",
     type: "game_over",
-    summary: state.winnerIds.length === 1
-      ? `${state.players[state.winnerIds[0]].label} wins the grid`
-      : "The grid ended in a draw"
+    summary
   });
 }
 
 function updateCapturedNodeCounts() {
   for (const id of PLAYER_ORDER) {
     state.players[id].capturedNodes = state.nodes.filter((node) => node.owner === id).length;
+    state.players[id].score = state.nodes
+      .filter((node) => node.owner === id)
+      .reduce((sum, node) => sum + (node.value || 1), 0);
   }
 }
 
@@ -911,7 +923,7 @@ function page() {
           const owner = node.owner ? state.players[node.owner] : null;
           ctx.fillStyle = owner ? owner.color : "#ffd166";
           ctx.beginPath();
-          ctx.arc(node.x * size + size / 2, node.y * size + size / 2, size * 0.22, 0, Math.PI * 2);
+          ctx.arc(node.x * size + size / 2, node.y * size + size / 2, size * (node.value > 1 ? 0.28 : 0.22), 0, Math.PI * 2);
           ctx.fill();
           ctx.strokeStyle = owner ? owner.accent : "rgba(255,209,102,0.45)";
           ctx.lineWidth = 3;
@@ -948,6 +960,8 @@ function page() {
             "Pos: (" + player.pos.x + ", " + player.pos.y + ")<br>" +
             "HP: " + player.hp + " / " + player.maxHp + "<br>" +
             "Nodes: " + player.capturedNodes + "<br>" +
+            "Score: " + player.score + "<br>" +
+            "Damage: " + player.damageDealt + "<br>" +
             "Respawn: " + player.respawnIn + "<br>" +
             "Status: " + (player.alive ? "Online" : "Offline") + "<br>" +
             "Queued: " + (pending ? pending.type + (pending.direction ? " " + pending.direction : "") : "none") +
@@ -1291,7 +1305,7 @@ function humanPage() {
           const owner = node.owner ? state.players[node.owner] : null;
           ctx.fillStyle = owner ? owner.color : "#ffd166";
           ctx.beginPath();
-          ctx.arc(node.x * size + size / 2, node.y * size + size / 2, size * 0.22, 0, Math.PI * 2);
+          ctx.arc(node.x * size + size / 2, node.y * size + size / 2, size * (node.value > 1 ? 0.28 : 0.22), 0, Math.PI * 2);
           ctx.fill();
           ctx.strokeStyle = owner ? owner.accent : "rgba(255,209,102,0.45)";
           ctx.lineWidth = 3;
@@ -1329,6 +1343,8 @@ function humanPage() {
             "Position: (" + player.pos.x + ", " + player.pos.y + ")<br>" +
             "HP: " + player.hp + " / " + player.maxHp + "<br>" +
             "Nodes: " + player.capturedNodes + "<br>" +
+            "Score: " + player.score + "<br>" +
+            "Damage: " + player.damageDealt + "<br>" +
             "Respawn: " + player.respawnIn + "<br>" +
             "Queued: " + (pending ? pending.type + (pending.direction ? " " + pending.direction : "") : "none") +
           "</div>";

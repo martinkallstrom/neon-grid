@@ -18,11 +18,14 @@ Agent-first turn-based cyberpunk tactics game.
 - 5 capture nodes
 - Center node is worth double
 - Simultaneous turn resolution
-- Actions: `move`, `hack`, `capture`, `wait`
+- Actions: `move`, `hack`, `capture`, `fortify`, `siphon`, `wait`
+- Action costs: `move=1`, `capture=1`, `hack=2`, `fortify=2`
 - `hack` damages adjacent enemies for 1 HP
+- `fortify` adds 1 shield up to a cap of 2
+- `siphon` on a node you own grants +2 extra energy
+- Controlled nodes grant both energy and victory points each resolved turn
 - Players have 3 HP and respawn after missing 1 turn
-- Match ends after 30 turns
-- Ties break on total damage dealt
+- Match ends when someone reaches the objective score and wins the tiebreak
 
 ## API
 
@@ -33,10 +36,11 @@ Returns the full public match state:
 ```json
 {
   "turn": 1,
-  "maxTurns": 30,
+  "objectiveScore": 15,
   "phase": "waiting_for_actions",
   "winnerIds": [],
   "grid": { "width": 12, "height": 12, "walls": [[3, 3]] },
+  "rules": {},
   "players": {},
   "nodes": [],
   "pendingActions": {},
@@ -63,6 +67,7 @@ Notes:
 - `direction` is only used for `move`
 - `turn` must match the current turn
 - `actionId` is optional but supported for idempotency
+- energy costs are exposed in `state.rules.actionCosts`
 - `GET /action?...` also works for simple bot clients
 
 ### `POST /reset`

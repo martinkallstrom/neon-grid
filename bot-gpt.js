@@ -20,6 +20,18 @@ function samePos(a, b) {
   return a.x === b.x && a.y === b.y;
 }
 
+function manhattan(a, b) {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+
+function actionCost(state, type) {
+  return state.rules?.actionCosts?.[type] || 0;
+}
+
+function canAfford(state, me, type) {
+  return me.energy >= actionCost(state, type);
+}
+
 function neighbors(pos, state) {
   const occupied = new Set(
     Object.values(state.players)
@@ -44,14 +56,14 @@ function neighbors(pos, state) {
     });
 }
 
-function bfsDirection(state, start, targetTest) {
-  const queue = [{ pos: start, firstDir: null }];
+function bfsPath(state, start, targetTest) {
+  const queue = [{ pos: start, firstDir: null, distance: 0 }];
   const seen = new Set([key(start)]);
 
   while (queue.length > 0) {
     const current = queue.shift();
     if (targetTest(current.pos) && current.firstDir) {
-      return current.firstDir;
+      return { direction: current.firstDir, distance: current.distance };
     }
 
     for (const next of neighbors(current.pos, state)) {
@@ -60,7 +72,8 @@ function bfsDirection(state, start, targetTest) {
       seen.add(nextKey);
       queue.push({
         pos: next.pos,
-        firstDir: current.firstDir || next.dir.name
+        firstDir: current.firstDir || next.dir.name,
+        distance: current.distance + 1
       });
     }
   }
@@ -68,31 +81,63 @@ function bfsDirection(state, start, targetTest) {
   return null;
 }
 
+function bestNodePath(state, me) {
+  const candidates = state.nodes
+    .filter((node) => node.owner !== playerId)
+    .map((node) => {
+      const path = bfsPath(state, me.pos, (pos) => samePos(pos, node));
+      if (!path) return null;
+      const enemyOwned = node.owner && node.owner !== playerId ? 1 : 0;
+      return {
+        node,
+        direction: path.direction,
+        score: node.value * 10 + enemyOwned * 3 - path.distance
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  return candidates[0] || null;
+}
+
 function chooseAction(state) {
   const me = state.players[playerId];
   const enemies = Object.values(state.players).filter((player) => player.id !== playerId && player.alive);
   const hereNode = state.nodes.find((node) => samePos(node, me.pos));
-  const adjacentEnemy = enemies.find((enemy) => Math.abs(enemy.pos.x - me.pos.x) + Math.abs(enemy.pos.y - me.pos.y) === 1);
+  const adjacentEnemy = enemies.find((enemy) => manhattan(enemy.pos, me.pos) === 1);
 
-  if (hereNode && hereNode.owner !== playerId) {
+  if (hereNode && hereNode.owner === playerId && me.energy <= 1) {
+    return { type: "siphon" };
+  }
+
+  if (hereNode && hereNode.owner !== playerId && canAfford(state, me, "capture")) {
     return { type: "capture" };
   }
 
-  if (adjacentEnemy) {
+  if (adjacentEnemy && me.hp === 1 && me.shields === 0 && canAfford(state, me, "fortify")) {
+    return { type: "fortify" };
+  }
+
+  if (adjacentEnemy && canAfford(state, me, "hack")) {
     return { type: "hack" };
   }
 
-  const targetNodeDir = bfsDirection(state, me.pos, (pos) => {
-    const node = state.nodes.find((entry) => samePos(entry, pos));
-    return node && node.owner !== playerId;
-  });
-  if (targetNodeDir) {
-    return { type: "move", direction: targetNodeDir };
+  const targetNode = bestNodePath(state, me);
+  if (targetNode && canAfford(state, me, "move")) {
+    return { type: "move", direction: targetNode.direction };
   }
 
-  const enemyDir = bfsDirection(state, me.pos, (pos) => enemies.some((enemy) => samePos(enemy.pos, pos)));
-  if (enemyDir) {
-    return { type: "move", direction: enemyDir };
+  if (adjacentEnemy && me.shields < 1 && canAfford(state, me, "fortify")) {
+    return { type: "fortify" };
+  }
+
+  const enemyPath = bfsPath(state, me.pos, (pos) => enemies.some((enemy) => samePos(enemy.pos, pos)));
+  if (enemyPath && canAfford(state, me, "move")) {
+    return { type: "move", direction: enemyPath.direction };
+  }
+
+  if (hereNode && hereNode.owner === playerId) {
+    return { type: "siphon" };
   }
 
   return { type: "wait" };

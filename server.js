@@ -1,15 +1,26 @@
 const http = require("node:http");
 
 const PORT = Number(process.env.PORT || 3000);
-const MAX_TURNS = 30;
+const OBJECTIVE_SCORE = 15;
 const MAX_LOG_ENTRIES = 120;
+const STARTING_ENERGY = 3;
+const SIPHON_GAIN = 2;
+const SHIELD_CAP = 2;
 const DIRECTIONS = {
   north: { x: 0, y: -1, label: "North" },
   south: { x: 0, y: 1, label: "South" },
   west: { x: -1, y: 0, label: "West" },
   east: { x: 1, y: 0, label: "East" }
 };
-const ACTION_TYPES = new Set(["move", "hack", "capture", "wait"]);
+const ACTION_TYPES = new Set(["move", "hack", "capture", "fortify", "siphon", "wait"]);
+const ACTION_COSTS = {
+  move: 1,
+  capture: 1,
+  hack: 2,
+  fortify: 2,
+  siphon: 0,
+  wait: 0
+};
 const PLAYER_ORDER = ["gpt", "claude"];
 const PLAYER_TEMPLATES = {
   gpt: {
@@ -59,6 +70,10 @@ function createInitialState() {
       respawnIn: 0,
       capturedNodes: 0,
       score: 0,
+      victoryPoints: 0,
+      energy: STARTING_ENERGY,
+      income: 0,
+      shields: 0,
       damageDealt: 0,
       alive: true,
       lastAction: null
@@ -69,13 +84,20 @@ function createInitialState() {
 
   return {
     turn: 1,
-    maxTurns: MAX_TURNS,
+    objectiveScore: OBJECTIVE_SCORE,
     phase: "waiting_for_actions",
     winnerIds: [],
     grid: {
       width: 12,
       height: 12,
       walls: WALLS.map(([x, y]) => [x, y])
+    },
+    rules: {
+      actionCosts: { ...ACTION_COSTS },
+      siphonGain: SIPHON_GAIN,
+      shieldCap: SHIELD_CAP,
+      objectiveScore: OBJECTIVE_SCORE,
+      income: "Players gain energy and victory points equal to controlled node value after each resolved turn."
     },
     players,
     nodes,
@@ -137,10 +159,11 @@ function route(req, res) {
 function publicState() {
   return {
     turn: state.turn,
-    maxTurns: state.maxTurns,
+    objectiveScore: state.objectiveScore,
     phase: state.phase,
     winnerIds: state.winnerIds,
     grid: state.grid,
+    rules: state.rules,
     players: state.players,
     nodes: state.nodes,
     pendingActions: state.pendingActions,
@@ -198,6 +221,15 @@ function submitAction(input) {
     }
   }
 
+  const cost = actionCost(type);
+  if (player.energy < cost) {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: `${player.label} needs ${cost} energy for ${type} but only has ${player.energy}` }
+    };
+  }
+
   const existing = state.pendingActions[playerId];
   const nextAction = {
     turn,
@@ -253,16 +285,19 @@ function resolveTurn() {
     actions[id] = state.pendingActions[id] || defaultAction(id);
   }
 
+  spendActionCosts(turn, actions, actionableIds);
   resolveMoves(turn, actions, actionableIds);
   resolveCaptures(turn, actions, actionableIds);
+  resolveFortifies(turn, actions, actionableIds);
+  resolveSiphons(turn, actions, actionableIds);
   resolveHacks(turn, actions, actionableIds);
   tickRespawns(turn, deadAtStart);
   updateCapturedNodeCounts();
+  distributeEconomy(turn);
 
   state.pendingActions = {};
 
-  if (turn >= state.maxTurns) {
-    finishGame();
+  if (finishGame(turn)) {
     return;
   }
 
@@ -384,6 +419,56 @@ function resolveCaptures(turn, actions, actionableIds) {
   }
 }
 
+function resolveFortifies(turn, actions, actionableIds) {
+  for (const id of actionableIds) {
+    const action = actions[id];
+    if (action.type !== "fortify") continue;
+    const player = state.players[id];
+    const nextShields = Math.min(SHIELD_CAP, player.shields + 1);
+    if (nextShields === player.shields) {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "fortify_cap",
+        summary: `${player.label} tried to fortify beyond the shield cap`
+      });
+      continue;
+    }
+    player.shields = nextShields;
+    appendLog({
+      turn,
+      playerId: id,
+      type: "fortify",
+      summary: `${player.label} fortified to ${player.shields} shield`
+    });
+  }
+}
+
+function resolveSiphons(turn, actions, actionableIds) {
+  for (const id of actionableIds) {
+    const action = actions[id];
+    if (action.type !== "siphon") continue;
+    const player = state.players[id];
+    const node = state.nodes.find((entry) => samePos(entry, player.pos));
+    if (!node || node.owner !== id) {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "siphon_failed",
+        summary: `${player.label} tried to siphon without owning the node`
+      });
+      continue;
+    }
+    player.energy += SIPHON_GAIN;
+    appendLog({
+      turn,
+      playerId: id,
+      type: "siphon",
+      summary: `${player.label} siphoned +${SIPHON_GAIN} energy from node ${node.id}`
+    });
+  }
+}
+
 function resolveHacks(turn, actions, actionableIds) {
   const damage = {};
 
@@ -421,17 +506,32 @@ function resolveHacks(turn, actions, actionableIds) {
 
   for (const [targetId, amount] of Object.entries(damage)) {
     const player = state.players[targetId];
-    player.hp -= amount;
+    const absorbed = Math.min(player.shields, amount);
+    const dealt = amount - absorbed;
+    if (absorbed > 0) {
+      player.shields -= absorbed;
+      appendLog({
+        turn,
+        playerId: targetId,
+        type: "shield_absorb",
+        summary: `${player.label}'s shields absorbed ${absorbed} damage`
+      });
+    }
+    if (dealt === 0) {
+      continue;
+    }
+    player.hp -= dealt;
     appendLog({
       turn,
       playerId: targetId,
       type: "damage",
-      summary: `${player.label} took ${amount} damage`
+      summary: `${player.label} took ${dealt} damage`
     });
     if (player.hp <= 0) {
       player.hp = 0;
       player.alive = false;
       player.respawnIn = 1;
+      player.shields = 0;
       appendLog({
         turn,
         playerId: targetId,
@@ -472,11 +572,6 @@ function advanceRespawnOnlyTurns() {
       }
     }
 
-    if (state.turn >= state.maxTurns) {
-      finishGame();
-      return;
-    }
-
     state.turn += 1;
   }
 }
@@ -484,6 +579,7 @@ function advanceRespawnOnlyTurns() {
 function respawnPlayer(turn, player) {
   player.alive = true;
   player.hp = player.maxHp;
+  player.shields = 0;
   player.pos = findSpawn(player.start);
   appendLog({
     turn,
@@ -511,34 +607,57 @@ function findSpawn(preferred) {
   return { ...preferred };
 }
 
-function finishGame() {
-  updateCapturedNodeCounts();
-  const bestScore = Math.max(...PLAYER_ORDER.map((id) => state.players[id].score));
-  let contenders = PLAYER_ORDER.filter((id) => state.players[id].score === bestScore);
-  if (contenders.length > 1) {
-    const bestDamage = Math.max(...contenders.map((id) => state.players[id].damageDealt));
-    contenders = contenders.filter((id) => state.players[id].damageDealt === bestDamage);
-  }
-  state.winnerIds = contenders;
-  state.phase = "game_over";
-  const summary = state.winnerIds.length === 1
-    ? `${state.players[state.winnerIds[0]].label} wins the grid`
-    : "The grid ended in a draw";
-  appendLog({
-    turn: state.turn,
-    playerId: "system",
-    type: "game_over",
-    summary
-  });
-}
-
 function updateCapturedNodeCounts() {
   for (const id of PLAYER_ORDER) {
     state.players[id].capturedNodes = state.nodes.filter((node) => node.owner === id).length;
     state.players[id].score = state.nodes
       .filter((node) => node.owner === id)
       .reduce((sum, node) => sum + (node.value || 1), 0);
+    state.players[id].income = state.players[id].score;
   }
+}
+
+function distributeEconomy(turn) {
+  for (const id of PLAYER_ORDER) {
+    const player = state.players[id];
+    if (player.income > 0) {
+      player.energy += player.income;
+      player.victoryPoints += player.income;
+      appendLog({
+        turn,
+        playerId: id,
+        type: "income",
+        summary: `${player.label} banked +${player.income} energy and +${player.income} VP`
+      });
+    }
+  }
+}
+
+function finishGame(turn) {
+  updateCapturedNodeCounts();
+  const bestVp = Math.max(...PLAYER_ORDER.map((id) => state.players[id].victoryPoints));
+  if (bestVp < state.objectiveScore) {
+    return false;
+  }
+
+  let contenders = PLAYER_ORDER.filter((id) => state.players[id].victoryPoints === bestVp);
+  if (contenders.length > 1) {
+    const bestDamage = Math.max(...contenders.map((id) => state.players[id].damageDealt));
+    contenders = contenders.filter((id) => state.players[id].damageDealt === bestDamage);
+  }
+  if (contenders.length !== 1) {
+    return false;
+  }
+
+  state.winnerIds = contenders;
+  state.phase = "game_over";
+  appendLog({
+    turn,
+    playerId: "system",
+    type: "game_over",
+    summary: `${state.players[state.winnerIds[0]].label} wins the grid at ${bestVp} VP`
+  });
+  return true;
 }
 
 function defaultAction(playerId) {
@@ -562,7 +681,32 @@ function describeAction(action) {
   if (action.type === "move") {
     return `MOVE ${action.direction}`;
   }
+  if (action.type === "fortify") {
+    return "FORTIFY";
+  }
+  if (action.type === "siphon") {
+    return "SIPHON";
+  }
   return action.type.toUpperCase();
+}
+
+function actionCost(type) {
+  return ACTION_COSTS[type] || 0;
+}
+
+function spendActionCosts(turn, actions, actionableIds) {
+  for (const id of actionableIds) {
+    const action = actions[id];
+    const cost = actionCost(action.type);
+    if (cost === 0) continue;
+    state.players[id].energy = Math.max(0, state.players[id].energy - cost);
+    appendLog({
+      turn,
+      playerId: id,
+      type: "energy_spend",
+      summary: `${state.players[id].label} spent ${cost} energy on ${action.type}`
+    });
+  }
 }
 
 function isWalkable(pos) {
@@ -796,6 +940,11 @@ function page() {
         border: 1px solid var(--panel-border);
         color: var(--text);
       }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        filter: saturate(0.4);
+      }
       .log {
         display: grid;
         gap: 8px;
@@ -928,6 +1077,10 @@ function page() {
           ctx.strokeStyle = owner ? owner.accent : "rgba(255,209,102,0.45)";
           ctx.lineWidth = 3;
           ctx.stroke();
+          ctx.fillStyle = "#08111f";
+          ctx.font = "bold 14px Avenir Next, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(String(node.value), node.x * size + size / 2, node.y * size + size / 2 + 5);
         }
 
         for (const player of Object.values(state.players)) {
@@ -937,15 +1090,36 @@ function page() {
           ctx.strokeStyle = player.accent;
           ctx.lineWidth = 2;
           ctx.strokeRect(player.pos.x * size + 10, player.pos.y * size + 10, size - 20, size - 20);
+          ctx.fillStyle = "#f4f8ff";
+          ctx.font = "bold 14px Avenir Next, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(player.label[0], player.pos.x * size + size / 2, player.pos.y * size + size / 2 + 5);
+          if (player.shields > 0) {
+            ctx.fillStyle = "#ffd166";
+            ctx.font = "12px Avenir Next, sans-serif";
+            ctx.fillText("S" + player.shields, player.pos.x * size + size / 2, player.pos.y * size + size - 8);
+          }
         }
         ctx.globalAlpha = 1;
+      }
+
+      function actionCost(state, type) {
+        return state.rules.actionCosts[type] || 0;
+      }
+
+      function canQueue(state, player, type) {
+        return state.phase === "waiting_for_actions" &&
+          player.alive &&
+          player.respawnIn === 0 &&
+          player.energy >= actionCost(state, type);
       }
 
       function renderStatus(state) {
         const pendingCount = Object.keys(state.pendingActions).length;
         const winners = state.winnerIds.length ? "Winner: " + state.winnerIds.map((id) => state.players[id].label).join(", ") : "Winner: pending";
         statusEl.innerHTML = [
-          "<span>Turn " + state.turn + " / " + state.maxTurns + "</span>",
+          "<span>Turn " + state.turn + "</span>",
+          "<span>Objective: " + state.objectiveScore + " VP</span>",
           "<span>Phase: " + state.phase + "</span>",
           "<span>Pending actions: " + pendingCount + "</span>",
           "<span>" + winners + "</span>"
@@ -959,8 +1133,11 @@ function page() {
             "<strong style=\\"color:" + player.color + "\\">" + player.label + "</strong><br>" +
             "Pos: (" + player.pos.x + ", " + player.pos.y + ")<br>" +
             "HP: " + player.hp + " / " + player.maxHp + "<br>" +
+            "Energy: " + player.energy + " (+" + player.income + "/turn)<br>" +
+            "Shields: " + player.shields + "<br>" +
             "Nodes: " + player.capturedNodes + "<br>" +
-            "Score: " + player.score + "<br>" +
+            "Board score: " + player.score + "<br>" +
+            "Victory: " + player.victoryPoints + " / " + state.objectiveScore + "<br>" +
             "Damage: " + player.damageDealt + "<br>" +
             "Respawn: " + player.respawnIn + "<br>" +
             "Status: " + (player.alive ? "Online" : "Offline") + "<br>" +
@@ -969,8 +1146,11 @@ function page() {
         }).join("");
       }
 
-      function actionButton(playerId, label, payload, className) {
-        return "<button class=\\"" + className + "\\" data-player=\\"" + playerId + "\\" data-payload='" + JSON.stringify(payload) + "'>" + label + "</button>";
+      function actionButton(state, player, label, payload, className) {
+        const cost = actionCost(state, payload.type);
+        const disabled = canQueue(state, player, payload.type) ? "" : " disabled";
+        const suffix = cost > 0 ? " [" + cost + "E]" : "";
+        return "<button class=\\"" + className + "\\" data-player=\\"" + player.id + "\\" data-payload='" + JSON.stringify(payload) + "'" + disabled + ">" + label + suffix + "</button>";
       }
 
       function renderControls(state) {
@@ -978,13 +1158,15 @@ function page() {
           return "<section>" +
             "<strong style=\\"color:" + player.color + "\\">" + player.label + "</strong>" +
             "<div class=\\"action-grid\\">" +
-              actionButton(player.id, "North", { type: "move", direction: "north" }, player.id === "claude" ? "alt" : "") +
-              actionButton(player.id, "Hack", { type: "hack" }, "secondary") +
-              actionButton(player.id, "East", { type: "move", direction: "east" }, player.id === "claude" ? "alt" : "") +
-              actionButton(player.id, "West", { type: "move", direction: "west" }, player.id === "claude" ? "alt" : "") +
-              actionButton(player.id, "Capture", { type: "capture" }, "secondary") +
-              actionButton(player.id, "South", { type: "move", direction: "south" }, player.id === "claude" ? "alt" : "") +
-              actionButton(player.id, "Wait", { type: "wait" }, "ghost") +
+              actionButton(state, player, "North", { type: "move", direction: "north" }, player.id === "claude" ? "alt" : "") +
+              actionButton(state, player, "Hack", { type: "hack" }, "secondary") +
+              actionButton(state, player, "Siphon", { type: "siphon" }, "ghost") +
+              actionButton(state, player, "West", { type: "move", direction: "west" }, player.id === "claude" ? "alt" : "") +
+              actionButton(state, player, "Capture", { type: "capture" }, "secondary") +
+              actionButton(state, player, "East", { type: "move", direction: "east" }, player.id === "claude" ? "alt" : "") +
+              actionButton(state, player, "Fortify", { type: "fortify" }, "secondary") +
+              actionButton(state, player, "South", { type: "move", direction: "south" }, player.id === "claude" ? "alt" : "") +
+              actionButton(state, player, "Wait", { type: "wait" }, "ghost") +
             "</div>" +
           "</section>";
         }).join("");
@@ -1166,10 +1348,18 @@ function humanPage() {
         color: var(--text);
         border: 1px solid var(--border);
       }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        filter: saturate(0.4);
+      }
       .row {
         display: grid;
         grid-template-columns: 1fr 1fr 1fr;
         gap: 10px;
+      }
+      .row.two {
+        grid-template-columns: 1fr 1fr;
       }
       .player-cards {
         display: grid;
@@ -1229,18 +1419,22 @@ function humanPage() {
           <div class="hint" id="selectionHint">Selected player: GPT</div>
           <div class="dpad">
             <div></div>
-            <button class="move" data-type="move" data-direction="north">North</button>
+            <button class="move" data-label="North" data-type="move" data-direction="north">North</button>
             <div></div>
-            <button class="move" data-type="move" data-direction="west">West</button>
-            <button class="act" data-type="capture">Capture</button>
-            <button class="move" data-type="move" data-direction="east">East</button>
+            <button class="move" data-label="West" data-type="move" data-direction="west">West</button>
+            <button class="act" data-label="Capture" data-type="capture">Capture</button>
+            <button class="move" data-label="East" data-type="move" data-direction="east">East</button>
             <div></div>
-            <button class="move" data-type="move" data-direction="south">South</button>
+            <button class="move" data-label="South" data-type="move" data-direction="south">South</button>
             <div></div>
           </div>
           <div class="row">
-            <button class="warn" data-type="hack">Hack</button>
-            <button class="ghost" data-type="wait">Wait</button>
+            <button class="warn" data-label="Hack" data-type="hack">Hack</button>
+            <button class="act" data-label="Fortify" data-type="fortify">Fortify</button>
+            <button class="ghost" data-label="Siphon" data-type="siphon">Siphon</button>
+          </div>
+          <div class="row two">
+            <button class="ghost" data-label="Wait" data-type="wait">Wait</button>
             <button class="ghost" id="reset">Reset</button>
           </div>
         </article>
@@ -1310,6 +1504,10 @@ function humanPage() {
           ctx.strokeStyle = owner ? owner.accent : "rgba(255,209,102,0.45)";
           ctx.lineWidth = 3;
           ctx.stroke();
+          ctx.fillStyle = "#08111f";
+          ctx.font = "bold 14px Avenir Next, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(String(node.value), node.x * size + size / 2, node.y * size + size / 2 + 5);
         }
 
         for (const player of Object.values(state.players)) {
@@ -1319,8 +1517,29 @@ function humanPage() {
           ctx.strokeStyle = player.id === selectedPlayer ? "#ffffff" : player.accent;
           ctx.lineWidth = player.id === selectedPlayer ? 4 : 2;
           ctx.strokeRect(player.pos.x * size + 10, player.pos.y * size + 10, size - 20, size - 20);
+          ctx.fillStyle = "#f4f8ff";
+          ctx.font = "bold 14px Avenir Next, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(player.label[0], player.pos.x * size + size / 2, player.pos.y * size + size / 2 + 5);
+          if (player.shields > 0) {
+            ctx.fillStyle = "#ffd166";
+            ctx.font = "12px Avenir Next, sans-serif";
+            ctx.fillText("S" + player.shields, player.pos.x * size + size / 2, player.pos.y * size + size - 8);
+          }
         }
         ctx.globalAlpha = 1;
+      }
+
+      function actionCost(state, type) {
+        return state.rules.actionCosts[type] || 0;
+      }
+
+      function isAvailable(state, playerId, type) {
+        const player = state.players[playerId];
+        return state.phase === "waiting_for_actions" &&
+          player.alive &&
+          player.respawnIn === 0 &&
+          player.energy >= actionCost(state, type);
       }
 
       function renderStatus(state) {
@@ -1328,7 +1547,8 @@ function humanPage() {
           ? "Winner: " + state.winnerIds.map((id) => state.players[id].label).join(", ")
           : "Winner: pending";
         statusEl.innerHTML = [
-          "<span class=\\"pill\\">Turn " + state.turn + " / " + state.maxTurns + "</span>",
+          "<span class=\\"pill\\">Turn " + state.turn + "</span>",
+          "<span class=\\"pill\\">Objective " + state.objectiveScore + " VP</span>",
           "<span class=\\"pill\\">Phase: " + state.phase + "</span>",
           "<span class=\\"pill\\">Queued: " + Object.keys(state.pendingActions).length + "</span>",
           "<span class=\\"pill\\">" + winner + "</span>"
@@ -1342,8 +1562,11 @@ function humanPage() {
             "<strong style=\\"color:" + player.color + "\\">" + player.label + "</strong><br>" +
             "Position: (" + player.pos.x + ", " + player.pos.y + ")<br>" +
             "HP: " + player.hp + " / " + player.maxHp + "<br>" +
+            "Energy: " + player.energy + " (+" + player.income + "/turn)<br>" +
+            "Shields: " + player.shields + "<br>" +
             "Nodes: " + player.capturedNodes + "<br>" +
-            "Score: " + player.score + "<br>" +
+            "Board score: " + player.score + "<br>" +
+            "Victory: " + player.victoryPoints + " / " + state.objectiveScore + "<br>" +
             "Damage: " + player.damageDealt + "<br>" +
             "Respawn: " + player.respawnIn + "<br>" +
             "Queued: " + (pending ? pending.type + (pending.direction ? " " + pending.direction : "") : "none") +
@@ -1364,6 +1587,18 @@ function humanPage() {
         hintEl.textContent = "Selected player: " + selectedPlayer.toUpperCase();
       }
 
+      function updateActionAvailability() {
+        document.querySelectorAll("[data-type]").forEach((button) => {
+          if (!latestState) {
+            button.disabled = true;
+            return;
+          }
+          button.disabled = !isAvailable(latestState, selectedPlayer, button.dataset.type);
+          const cost = actionCost(latestState, button.dataset.type);
+          button.textContent = button.dataset.label + (cost > 0 ? " [" + cost + "E]" : "");
+        });
+      }
+
       async function refresh() {
         latestState = await api("/state");
         renderStatus(latestState);
@@ -1371,19 +1606,21 @@ function humanPage() {
         renderLog(latestState);
         draw(latestState);
         updateSelection();
+        updateActionAvailability();
       }
 
       pickerEl.querySelectorAll("button").forEach((button) => {
         button.addEventListener("click", () => {
           selectedPlayer = button.dataset.player;
           updateSelection();
+          updateActionAvailability();
           if (latestState) draw(latestState);
         });
       });
 
       document.querySelectorAll("[data-type]").forEach((button) => {
         button.addEventListener("click", async () => {
-          if (!latestState) return;
+          if (!latestState || button.disabled) return;
           const payload = {
             player: selectedPlayer,
             type: button.dataset.type,

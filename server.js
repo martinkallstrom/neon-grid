@@ -3,6 +3,9 @@ const http = require("node:http");
 const PORT = Number(process.env.PORT || 3000);
 const OBJECTIVE_SCORE = 15;
 const MAX_LOG_ENTRIES = 120;
+const MIN_PLAYERS = 2;
+const MAX_PLAYERS = 6;
+const BASE_INCOME = 1;
 const STARTING_ENERGY = 3;
 const SIPHON_GAIN = 2;
 const SHIELD_CAP = 2;
@@ -21,23 +24,26 @@ const ACTION_COSTS = {
   siphon: 0,
   wait: 0
 };
-const PLAYER_ORDER = ["gpt", "claude"];
-const PLAYER_TEMPLATES = {
-  gpt: {
-    id: "gpt",
-    label: "GPT",
-    color: "#00f5ff",
-    accent: "#7df9ff",
-    start: { x: 0, y: 0 }
-  },
-  claude: {
-    id: "claude",
-    label: "Claude",
-    color: "#ff4fd8",
-    accent: "#ff9bf0",
-    start: { x: 11, y: 11 }
-  }
+const PLAYER_STYLES = [
+  { color: "#00f5ff", accent: "#7df9ff" },
+  { color: "#ff4fd8", accent: "#ff9bf0" },
+  { color: "#9cff57", accent: "#d0ff8c" },
+  { color: "#ff9b42", accent: "#ffd39e" },
+  { color: "#7c8cff", accent: "#b4bdff" },
+  { color: "#ff667a", accent: "#ffb0ba" }
+];
+const PLAYER_IDENTITIES = {
+  gpt: { styleIndex: 0, slotIndex: 0, label: "GPT" },
+  claude: { styleIndex: 1, slotIndex: 1, label: "Claude" }
 };
+const SPAWN_SLOTS = [
+  { x: 0, y: 0 },
+  { x: 11, y: 11 },
+  { x: 11, y: 0 },
+  { x: 0, y: 11 },
+  { x: 5, y: 0 },
+  { x: 6, y: 11 }
+];
 const WALLS = [
   [3, 3], [3, 4], [4, 3],
   [8, 8], [8, 7], [7, 8],
@@ -54,38 +60,21 @@ const NODE_POSITIONS = [
 
 let state = createInitialState();
 
-function createInitialState() {
+function createInitialState(roster = []) {
   const players = {};
-  for (const id of PLAYER_ORDER) {
-    const template = PLAYER_TEMPLATES[id];
-    players[id] = {
-      id: template.id,
-      label: template.label,
-      color: template.color,
-      accent: template.accent,
-      start: { ...template.start },
-      pos: { ...template.start },
-      hp: 3,
-      maxHp: 3,
-      respawnIn: 0,
-      capturedNodes: 0,
-      score: 0,
-      victoryPoints: 0,
-      energy: STARTING_ENERGY,
-      income: 0,
-      shields: 0,
-      damageDealt: 0,
-      alive: true,
-      lastAction: null
-    };
+  const playerOrder = [];
+  for (let index = 0; index < roster.length; index++) {
+    const config = roster[index];
+    players[config.id] = createPlayer(config, index);
+    playerOrder.push(config.id);
   }
 
   const nodes = NODE_POSITIONS.map((node) => ({ ...node, owner: null }));
 
   return {
-    turn: 1,
+    turn: 0,
     objectiveScore: OBJECTIVE_SCORE,
-    phase: "waiting_for_actions",
+    phase: "lobby",
     winnerIds: [],
     grid: {
       width: 12,
@@ -97,20 +86,68 @@ function createInitialState() {
       siphonGain: SIPHON_GAIN,
       shieldCap: SHIELD_CAP,
       objectiveScore: OBJECTIVE_SCORE,
-      income: "Players gain energy and victory points equal to controlled node value after each resolved turn."
+      minPlayers: MIN_PLAYERS,
+      maxPlayers: MAX_PLAYERS,
+      baseIncome: BASE_INCOME,
+      income: "Players gain 1 base energy plus controlled-node energy each resolved turn. Victory points still come only from controlled nodes."
     },
+    playerOrder,
     players,
     nodes,
     pendingActions: {},
     log: [
       {
-        turn: 1,
+        turn: 0,
         playerId: "system",
         type: "boot",
-        summary: "NEON GRID initialized"
+        summary: roster.length > 0
+          ? "NEON GRID lobby restored"
+          : "NEON GRID lobby initialized"
       }
     ]
   };
+}
+
+function createPlayer(config, index) {
+  return {
+    id: config.id,
+    label: config.label,
+    color: config.color,
+    accent: config.accent,
+    slotIndex: config.slotIndex ?? index,
+    start: { ...config.start },
+    pos: { ...config.start },
+    hp: 3,
+    maxHp: 3,
+    respawnIn: 0,
+    capturedNodes: 0,
+    score: 0,
+    victoryPoints: 0,
+    energy: STARTING_ENERGY,
+    income: 0,
+    shields: 0,
+    damageDealt: 0,
+    alive: true,
+    lastAction: null
+  };
+}
+
+function currentPlayerIds() {
+  return state.playerOrder.slice();
+}
+
+function rosterSnapshot() {
+  return currentPlayerIds().map((id) => {
+    const player = state.players[id];
+    return {
+      id: player.id,
+      label: player.label,
+      color: player.color,
+      accent: player.accent,
+      slotIndex: player.slotIndex,
+      start: { ...player.start }
+    };
+  });
 }
 
 function route(req, res) {
@@ -132,6 +169,21 @@ function route(req, res) {
     return json(res, 200, publicState());
   }
 
+  if ((req.method === "POST" || req.method === "GET") && url.pathname === "/join") {
+    return readBody(req).then((body) => {
+      const input = collectInput(url, body);
+      const result = joinPlayer(input);
+      return json(res, result.ok ? 200 : result.statusCode, result.body);
+    }).catch((error) => {
+      return json(res, 400, { error: error.message || "Invalid request body" });
+    });
+  }
+
+  if ((req.method === "POST" || req.method === "GET") && url.pathname === "/start") {
+    const result = startMatch();
+    return json(res, result.ok ? 200 : result.statusCode, result.body);
+  }
+
   if ((req.method === "POST" || req.method === "GET") && url.pathname === "/action") {
     return readBody(req).then((body) => {
       const input = collectInput(url, body);
@@ -143,14 +195,13 @@ function route(req, res) {
   }
 
   if ((req.method === "POST" || req.method === "GET") && url.pathname === "/reset") {
-    state = createInitialState();
-    appendLog({
-      turn: state.turn,
-      playerId: "system",
-      type: "reset",
-      summary: "Match reset"
+    return readBody(req).then((body) => {
+      const input = collectInput(url, body);
+      resetMatch(parseBoolean(input.clearPlayers));
+      return json(res, 200, { ok: true, state: publicState() });
+    }).catch((error) => {
+      return json(res, 400, { error: error.message || "Invalid request body" });
     });
-    return json(res, 200, { ok: true, state: publicState() });
   }
 
   return json(res, 404, { error: "Not found" });
@@ -164,6 +215,7 @@ function publicState() {
     winnerIds: state.winnerIds,
     grid: state.grid,
     rules: state.rules,
+    playerOrder: state.playerOrder,
     players: state.players,
     nodes: state.nodes,
     pendingActions: state.pendingActions,
@@ -174,11 +226,132 @@ function publicState() {
 function collectInput(url, body) {
   return {
     player: body.player || url.searchParams.get("player"),
+    label: body.label || url.searchParams.get("label"),
     type: body.type || url.searchParams.get("type"),
     direction: body.direction || body.dir || url.searchParams.get("direction") || url.searchParams.get("dir"),
     turn: body.turn || url.searchParams.get("turn"),
-    actionId: body.actionId || url.searchParams.get("actionId") || url.searchParams.get("action_id")
+    actionId: body.actionId || url.searchParams.get("actionId") || url.searchParams.get("action_id"),
+    clearPlayers: body.clearPlayers ?? url.searchParams.get("clearPlayers") ?? url.searchParams.get("clear_players")
   };
+}
+
+function joinPlayer(input) {
+  if (state.phase !== "lobby") {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: "Players can only join while the game is in lobby phase" }
+    };
+  }
+
+  const playerId = sanitizePlayerId(input.player);
+  if (!playerId) {
+    return {
+      ok: false,
+      statusCode: 400,
+      body: { error: "Player id must be 1-24 chars using a-z, 0-9, _ or -" }
+    };
+  }
+
+  if (state.players[playerId]) {
+    return { ok: true, statusCode: 200, body: { ok: true, deduped: true, state: publicState() } };
+  }
+
+  if (state.playerOrder.length >= MAX_PLAYERS) {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: `Lobby is full (${MAX_PLAYERS} players max)` }
+    };
+  }
+
+  const identity = PLAYER_IDENTITIES[playerId];
+  const takenSlots = new Set(currentPlayerIds().map((id) => state.players[id].slotIndex));
+  const slotIndex = identity && !takenSlots.has(identity.slotIndex)
+    ? identity.slotIndex
+    : firstFreeSlotIndex(takenSlots);
+  const styleIndex = identity ? identity.styleIndex : slotIndex % PLAYER_STYLES.length;
+  const style = PLAYER_STYLES[styleIndex];
+  const start = SPAWN_SLOTS[slotIndex % SPAWN_SLOTS.length];
+  const player = createPlayer({
+    id: playerId,
+    label: sanitizeLabel(input.label, identity?.label || playerId),
+    color: style.color,
+    accent: style.accent,
+    slotIndex,
+    start
+  }, slotIndex);
+
+  state.players[playerId] = player;
+  state.playerOrder.push(playerId);
+  appendLog({
+    turn: state.turn,
+    playerId,
+    type: "join",
+    summary: `${player.label} joined the lobby`
+  });
+
+  return { ok: true, statusCode: 200, body: { ok: true, state: publicState() } };
+}
+
+function startMatch() {
+  if (state.phase !== "lobby") {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: `Cannot start while phase is ${state.phase}` }
+    };
+  }
+
+  if (state.playerOrder.length < MIN_PLAYERS) {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: `Need at least ${MIN_PLAYERS} players to start` }
+    };
+  }
+
+  state.turn = 1;
+  state.phase = "waiting_for_actions";
+  state.winnerIds = [];
+  state.pendingActions = {};
+  state.nodes = NODE_POSITIONS.map((node) => ({ ...node, owner: null }));
+
+  currentPlayerIds().forEach((id, index) => {
+    const player = state.players[id];
+    player.pos = { ...player.start };
+    player.hp = player.maxHp;
+    player.respawnIn = 0;
+    player.capturedNodes = 0;
+    player.score = 0;
+    player.victoryPoints = 0;
+    player.energy = STARTING_ENERGY;
+    player.income = 0;
+    player.shields = 0;
+    player.damageDealt = 0;
+    player.alive = true;
+    player.lastAction = null;
+  });
+
+  appendLog({
+    turn: state.turn,
+    playerId: "system",
+    type: "start",
+    summary: `Match started with ${state.playerOrder.length} operators`
+  });
+
+  return { ok: true, statusCode: 200, body: { ok: true, state: publicState() } };
+}
+
+function resetMatch(clearPlayers) {
+  const roster = clearPlayers ? [] : rosterSnapshot();
+  state = createInitialState(roster);
+  appendLog({
+    turn: state.turn,
+    playerId: "system",
+    type: "reset",
+    summary: clearPlayers ? "Lobby reset and roster cleared" : "Lobby reset"
+  });
 }
 
 function submitAction(input) {
@@ -187,6 +360,13 @@ function submitAction(input) {
       ok: false,
       statusCode: 409,
       body: { error: "Game is over. Reset to start a new match." }
+    };
+  }
+  if (state.phase !== "waiting_for_actions") {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: `Cannot submit actions while phase is ${state.phase}` }
     };
   }
 
@@ -265,7 +445,7 @@ function readyToResolve() {
 }
 
 function getActionablePlayerIds() {
-  return PLAYER_ORDER.filter((id) => isActionablePlayer(state.players[id]));
+  return currentPlayerIds().filter((id) => isActionablePlayer(state.players[id]));
 }
 
 function isActionablePlayer(player) {
@@ -278,7 +458,7 @@ function resolveTurn() {
   const actions = {};
   const actionableIds = getActionablePlayerIds();
   const deadAtStart = new Set(
-    PLAYER_ORDER.filter((id) => !state.players[id].alive && state.players[id].respawnIn > 0)
+    currentPlayerIds().filter((id) => !state.players[id].alive && state.players[id].respawnIn > 0)
   );
 
   for (const id of actionableIds) {
@@ -554,7 +734,7 @@ function tickRespawns(turn, deadAtStart) {
 
 function advanceRespawnOnlyTurns() {
   while (state.phase !== "game_over" && getActionablePlayerIds().length === 0) {
-    const waiting = PLAYER_ORDER.filter((id) => !state.players[id].alive && state.players[id].respawnIn > 0);
+    const waiting = currentPlayerIds().filter((id) => !state.players[id].alive && state.players[id].respawnIn > 0);
     if (waiting.length === 0) break;
 
     appendLog({
@@ -608,7 +788,7 @@ function findSpawn(preferred) {
 }
 
 function updateCapturedNodeCounts() {
-  for (const id of PLAYER_ORDER) {
+  for (const id of currentPlayerIds()) {
     state.players[id].capturedNodes = state.nodes.filter((node) => node.owner === id).length;
     state.players[id].score = state.nodes
       .filter((node) => node.owner === id)
@@ -618,16 +798,24 @@ function updateCapturedNodeCounts() {
 }
 
 function distributeEconomy(turn) {
-  for (const id of PLAYER_ORDER) {
+  for (const id of currentPlayerIds()) {
     const player = state.players[id];
+    const energyGain = BASE_INCOME + player.income;
+    player.energy += energyGain;
     if (player.income > 0) {
-      player.energy += player.income;
       player.victoryPoints += player.income;
       appendLog({
         turn,
         playerId: id,
         type: "income",
-        summary: `${player.label} banked +${player.income} energy and +${player.income} VP`
+        summary: `${player.label} banked +${energyGain} energy and +${player.income} VP`
+      });
+    } else {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "income",
+        summary: `${player.label} banked +${energyGain} recovery energy`
       });
     }
   }
@@ -635,12 +823,16 @@ function distributeEconomy(turn) {
 
 function finishGame(turn) {
   updateCapturedNodeCounts();
-  const bestVp = Math.max(...PLAYER_ORDER.map((id) => state.players[id].victoryPoints));
+  const playerIds = currentPlayerIds();
+  if (playerIds.length === 0) {
+    return false;
+  }
+  const bestVp = Math.max(...playerIds.map((id) => state.players[id].victoryPoints));
   if (bestVp < state.objectiveScore) {
     return false;
   }
 
-  let contenders = PLAYER_ORDER.filter((id) => state.players[id].victoryPoints === bestVp);
+  let contenders = playerIds.filter((id) => state.players[id].victoryPoints === bestVp);
   if (contenders.length > 1) {
     const bestDamage = Math.max(...contenders.map((id) => state.players[id].damageDealt));
     contenders = contenders.filter((id) => state.players[id].damageDealt === bestDamage);
@@ -694,6 +886,34 @@ function actionCost(type) {
   return ACTION_COSTS[type] || 0;
 }
 
+function sanitizePlayerId(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!/^[a-z0-9_-]{1,24}$/.test(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+
+function sanitizeLabel(value, fallback) {
+  const normalized = String(value || fallback || "").trim().slice(0, 24);
+  return normalized || String(fallback || "").toUpperCase();
+}
+
+function parseBoolean(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+function firstFreeSlotIndex(takenSlots) {
+  for (let index = 0; index < MAX_PLAYERS; index++) {
+    if (!takenSlots.has(index)) {
+      return index;
+    }
+  }
+  return 0;
+}
+
 function spendActionCosts(turn, actions, actionableIds) {
   for (const id of actionableIds) {
     const action = actions[id];
@@ -722,7 +942,7 @@ function isWall(pos) {
 }
 
 function isOccupied(pos) {
-  return PLAYER_ORDER.some((id) => {
+  return currentPlayerIds().some((id) => {
     const player = state.players[id];
     return player.alive && samePos(player.pos, pos);
   });
@@ -1012,6 +1232,7 @@ function page() {
           <div class="panel-body stack">
             <div class="stats" id="players"></div>
             <div class="actions" id="controls"></div>
+            <button class="ghost" id="start">Start Match</button>
             <button class="ghost" id="reset">Reset Match</button>
             <div class="log" id="log"></div>
             <details>
@@ -1030,6 +1251,7 @@ function page() {
       const controlsEl = document.getElementById("controls");
       const logEl = document.getElementById("log");
       const dumpEl = document.getElementById("dump");
+      const startEl = document.getElementById("start");
       const resetEl = document.getElementById("reset");
       let lastState = null;
 
@@ -1119,6 +1341,7 @@ function page() {
         const winners = state.winnerIds.length ? "Winner: " + state.winnerIds.map((id) => state.players[id].label).join(", ") : "Winner: pending";
         statusEl.innerHTML = [
           "<span>Turn " + state.turn + "</span>",
+          "<span>Operators: " + state.playerOrder.length + " / " + state.rules.maxPlayers + "</span>",
           "<span>Objective: " + state.objectiveScore + " VP</span>",
           "<span>Phase: " + state.phase + "</span>",
           "<span>Pending actions: " + pendingCount + "</span>",
@@ -1201,7 +1424,13 @@ function page() {
         renderLog(state);
         dumpEl.textContent = JSON.stringify(state, null, 2);
         draw(state);
+        startEl.disabled = !(state.phase === "lobby" && state.playerOrder.length >= state.rules.minPlayers);
       }
+
+      startEl.addEventListener("click", async () => {
+        await api("/start", { method: "POST" });
+        await refresh();
+      });
 
       resetEl.addEventListener("click", async () => {
         await api("/reset", { method: "POST" });
@@ -1308,13 +1537,22 @@ function humanPage() {
         font: inherit;
         cursor: pointer;
       }
-      .picker button.active[data-player="gpt"] {
-        background: linear-gradient(135deg, rgba(0,245,255,0.25), rgba(0,245,255,0.12));
-        border-color: rgba(0,245,255,0.4);
+      .picker button.active {
+        background: rgba(255, 255, 255, 0.08);
+        box-shadow: inset 0 0 0 1px currentColor;
       }
-      .picker button.active[data-player="claude"] {
-        background: linear-gradient(135deg, rgba(255,79,216,0.26), rgba(255,79,216,0.12));
-        border-color: rgba(255,79,216,0.42);
+      .join-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr auto;
+        gap: 10px;
+      }
+      .join-grid input {
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(17, 27, 47, 0.92);
+        color: var(--text);
+        padding: 14px 12px;
+        font: inherit;
       }
       .dpad {
         display: grid;
@@ -1394,7 +1632,8 @@ function humanPage() {
       }
       @media (max-width: 720px) {
         .player-cards,
-        .picker {
+        .picker,
+        .join-grid {
           grid-template-columns: 1fr;
         }
       }
@@ -1412,11 +1651,13 @@ function humanPage() {
         </article>
 
         <article class="panel controls">
-          <div class="picker" id="picker">
-            <button data-player="gpt">Play As GPT</button>
-            <button data-player="claude">Play As Claude</button>
+          <div class="picker" id="picker"></div>
+          <div class="hint" id="selectionHint">Selected player: none</div>
+          <div class="join-grid">
+            <input id="joinId" placeholder="player id">
+            <input id="joinLabel" placeholder="label">
+            <button class="act" id="join">Join</button>
           </div>
-          <div class="hint" id="selectionHint">Selected player: GPT</div>
           <div class="dpad">
             <div></div>
             <button class="move" data-label="North" data-type="move" data-direction="north">North</button>
@@ -1435,7 +1676,11 @@ function humanPage() {
           </div>
           <div class="row two">
             <button class="ghost" data-label="Wait" data-type="wait">Wait</button>
+            <button class="ghost" id="start">Start</button>
+          </div>
+          <div class="row two">
             <button class="ghost" id="reset">Reset</button>
+            <button class="ghost" id="clear">Clear Lobby</button>
           </div>
         </article>
 
@@ -1454,10 +1699,15 @@ function humanPage() {
       const statusEl = document.getElementById("status");
       const pickerEl = document.getElementById("picker");
       const hintEl = document.getElementById("selectionHint");
+      const joinIdEl = document.getElementById("joinId");
+      const joinLabelEl = document.getElementById("joinLabel");
+      const joinEl = document.getElementById("join");
       const playersEl = document.getElementById("players");
       const logEl = document.getElementById("log");
+      const startEl = document.getElementById("start");
       const resetEl = document.getElementById("reset");
-      let selectedPlayer = "gpt";
+      const clearEl = document.getElementById("clear");
+      let selectedPlayer = "";
       let latestState = null;
 
       async function api(path, options) {
@@ -1536,6 +1786,7 @@ function humanPage() {
 
       function isAvailable(state, playerId, type) {
         const player = state.players[playerId];
+        if (!player) return false;
         return state.phase === "waiting_for_actions" &&
           player.alive &&
           player.respawnIn === 0 &&
@@ -1548,6 +1799,7 @@ function humanPage() {
           : "Winner: pending";
         statusEl.innerHTML = [
           "<span class=\\"pill\\">Turn " + state.turn + "</span>",
+          "<span class=\\"pill\\">Operators " + state.playerOrder.length + " / " + state.rules.maxPlayers + "</span>",
           "<span class=\\"pill\\">Objective " + state.objectiveScore + " VP</span>",
           "<span class=\\"pill\\">Phase: " + state.phase + "</span>",
           "<span class=\\"pill\\">Queued: " + Object.keys(state.pendingActions).length + "</span>",
@@ -1580,11 +1832,36 @@ function humanPage() {
         }).join("");
       }
 
+      function renderPicker(state) {
+        const ids = state.playerOrder || [];
+        if (!selectedPlayer || !state.players[selectedPlayer]) {
+          selectedPlayer = ids[0] || "";
+        }
+        pickerEl.innerHTML = ids.length
+          ? ids.map((id) => {
+              const player = state.players[id];
+              const active = id === selectedPlayer ? " active" : "";
+              return "<button class=\\"" + active.trim() + "\\" data-player=\\"" + id + "\\" style=\\"color:" + player.color + ";border-color:" + player.accent + "\\">" + player.label + "</button>";
+            }).join("")
+          : "<div class=\\"hint\\">No operators joined yet. Add at least two, then start.</div>";
+
+        pickerEl.querySelectorAll("button[data-player]").forEach((button) => {
+          button.addEventListener("click", () => {
+            selectedPlayer = button.dataset.player;
+            updateSelection();
+            updateActionAvailability();
+            if (latestState) draw(latestState);
+          });
+        });
+      }
+
       function updateSelection() {
-        pickerEl.querySelectorAll("button").forEach((button) => {
+        pickerEl.querySelectorAll("button[data-player]").forEach((button) => {
           button.classList.toggle("active", button.dataset.player === selectedPlayer);
         });
-        hintEl.textContent = "Selected player: " + selectedPlayer.toUpperCase();
+        hintEl.textContent = selectedPlayer
+          ? "Selected player: " + selectedPlayer.toUpperCase()
+          : "Selected player: none";
       }
 
       function updateActionAvailability() {
@@ -1597,10 +1874,13 @@ function humanPage() {
           const cost = actionCost(latestState, button.dataset.type);
           button.textContent = button.dataset.label + (cost > 0 ? " [" + cost + "E]" : "");
         });
+        joinEl.disabled = !!(latestState && latestState.phase !== "lobby");
+        startEl.disabled = !(latestState && latestState.phase === "lobby" && latestState.playerOrder.length >= latestState.rules.minPlayers);
       }
 
       async function refresh() {
         latestState = await api("/state");
+        renderPicker(latestState);
         renderStatus(latestState);
         renderPlayers(latestState);
         renderLog(latestState);
@@ -1608,15 +1888,6 @@ function humanPage() {
         updateSelection();
         updateActionAvailability();
       }
-
-      pickerEl.querySelectorAll("button").forEach((button) => {
-        button.addEventListener("click", () => {
-          selectedPlayer = button.dataset.player;
-          updateSelection();
-          updateActionAvailability();
-          if (latestState) draw(latestState);
-        });
-      });
 
       document.querySelectorAll("[data-type]").forEach((button) => {
         button.addEventListener("click", async () => {
@@ -1636,8 +1907,40 @@ function humanPage() {
         });
       });
 
+      joinEl.addEventListener("click", async () => {
+        const player = (joinIdEl.value || "").trim().toLowerCase();
+        if (!player) return;
+        const label = (joinLabelEl.value || "").trim();
+        await api("/join", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ player, label })
+        });
+        if (!selectedPlayer) {
+          selectedPlayer = player;
+        }
+        joinIdEl.value = "";
+        joinLabelEl.value = "";
+        await refresh();
+      });
+
+      startEl.addEventListener("click", async () => {
+        await api("/start", { method: "POST" });
+        await refresh();
+      });
+
       resetEl.addEventListener("click", async () => {
         await api("/reset", { method: "POST" });
+        await refresh();
+      });
+
+      clearEl.addEventListener("click", async () => {
+        await api("/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clearPlayers: true })
+        });
+        selectedPlayer = "";
         await refresh();
       });
 
@@ -1659,6 +1962,9 @@ if (require.main === module) {
 module.exports = {
   server,
   createInitialState,
+  joinPlayer,
+  startMatch,
+  resetMatch,
   submitAction,
   publicState
 };

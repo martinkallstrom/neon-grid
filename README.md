@@ -2,28 +2,30 @@
 
 Agent-first turn-based cyberpunk tactics game.
 
-## V1 Shape
+## Shape
 
 - Single `server.js` file
 - Node built-ins only
 - Browser spectator/player UI at `/`
 - Human play UI at `/human`
 - Agent-friendly JSON state at `/state`
-- Action submission endpoint for bots and humans
+- Lobby + control endpoints for bots and humans
 
 ## Current Rules
 
 - 12x12 grid with fixed walls
-- 2 players for v1: `gpt` and `claude`
+- 2-6 players
 - 5 capture nodes
 - Center node is worth double
+- Lobby flow: players join first, then a match starts explicitly
 - Simultaneous turn resolution
 - Actions: `move`, `hack`, `capture`, `fortify`, `siphon`, `wait`
 - Action costs: `move=1`, `capture=1`, `hack=2`, `fortify=2`
 - `hack` damages adjacent enemies for 1 HP
 - `fortify` adds 1 shield up to a cap of 2
 - `siphon` on a node you own grants +2 extra energy
-- Controlled nodes grant both energy and victory points each resolved turn
+- Every player gains +1 base energy each resolved turn
+- Controlled nodes add extra energy and victory points each resolved turn
 - Players have 3 HP and respawn after missing 1 turn
 - Match ends when someone reaches the objective score and wins the tiebreak
 
@@ -35,18 +37,34 @@ Returns the full public match state:
 
 ```json
 {
-  "turn": 1,
+  "turn": 0,
   "objectiveScore": 15,
-  "phase": "waiting_for_actions",
+  "phase": "lobby",
   "winnerIds": [],
   "grid": { "width": 12, "height": 12, "walls": [[3, 3]] },
   "rules": {},
+  "playerOrder": [],
   "players": {},
   "nodes": [],
   "pendingActions": {},
   "log": []
 }
 ```
+
+### `POST /join`
+
+Join the lobby:
+
+```json
+{
+  "player": "gpt",
+  "label": "GPT"
+}
+```
+
+### `POST /start`
+
+Starts a lobby match once at least 2 players have joined.
 
 ### `POST /action`
 
@@ -72,7 +90,15 @@ Notes:
 
 ### `POST /reset`
 
-Resets the match to the initial state.
+Resets back to lobby while keeping the current roster.
+
+To clear the lobby entirely:
+
+```json
+{
+  "clearPlayers": true
+}
+```
 
 ## Run
 
@@ -89,3 +115,5 @@ Example GPT bot client:
 ```bash
 node bot-gpt.js http://localhost:3000
 ```
+
+The reference bot now auto-joins the lobby and attempts to start the match once enough players are present.

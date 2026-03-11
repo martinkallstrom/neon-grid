@@ -1,5 +1,6 @@
 const baseUrl = process.argv[2] || "http://localhost:3000";
 const playerId = process.argv[3] || "gpt";
+const playerLabel = process.argv[4] || playerId.toUpperCase();
 const pollMs = Number(process.env.POLL_MS || 800);
 
 const DIRS = [
@@ -152,14 +153,35 @@ async function request(path, options) {
   return response.json();
 }
 
+async function ensureJoined() {
+  await request("/join", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ player: playerId, label: playerLabel })
+  });
+}
+
 async function tick() {
   const state = await request("/state");
   const me = state.players[playerId];
-  if (!me) throw new Error(`Unknown player ${playerId}`);
+  if (!me) {
+    await ensureJoined();
+    return;
+  }
   if (state.turn < lastSeenTurn) {
     lastSubmittedTurn = 0;
   }
   lastSeenTurn = state.turn;
+  if (state.phase === "lobby") {
+    if ((state.playerOrder || []).length >= (state.rules?.minPlayers || 2)) {
+      try {
+        await request("/start", { method: "POST" });
+      } catch (error) {
+        if (!String(error.message).includes("409")) throw error;
+      }
+    }
+    return;
+  }
   if (state.phase !== "waiting_for_actions") return;
   if (!me.alive || me.respawnIn > 0) return;
   if (state.pendingActions[playerId]) return;

@@ -1,63 +1,604 @@
 const http = require("node:http");
 
-const state = {
-  turn: 1,
-  phase: "waiting_for_actions",
-  grid: {
-    width: 12,
-    height: 12,
-    walls: [
-      [3, 3],
-      [3, 4],
-      [8, 7],
-      [8, 8]
-    ]
-  },
-  players: {
-    gpt: {
-      id: "gpt",
-      label: "GPT",
-      color: "#00f5ff",
-      pos: { x: 0, y: 0 },
-      hp: 3,
-      respawnIn: 0,
-      capturedNodes: 0,
-      alive: true
-    },
-    claude: {
-      id: "claude",
-      label: "Claude",
-      color: "#ff4fd8",
-      pos: { x: 11, y: 11 },
-      hp: 3,
-      respawnIn: 0,
-      capturedNodes: 0,
-      alive: true
-    }
-  },
-  nodes: [
-    { id: "n1", x: 2, y: 2, owner: null },
-    { id: "n2", x: 9, y: 2, owner: null },
-    { id: "n3", x: 2, y: 9, owner: null },
-    { id: "n4", x: 9, y: 9, owner: null }
-  ],
-  pendingActions: {},
-  log: [
-    {
-      turn: 1,
-      playerId: "system",
-      type: "boot",
-      summary: "NEON GRID scaffold initialized"
-    }
-  ]
+const PORT = Number(process.env.PORT || 3000);
+const MAX_TURNS = 30;
+const MAX_LOG_ENTRIES = 120;
+const DIRECTIONS = {
+  north: { x: 0, y: -1, label: "North" },
+  south: { x: 0, y: 1, label: "South" },
+  west: { x: -1, y: 0, label: "West" },
+  east: { x: 1, y: 0, label: "East" }
 };
+const ACTION_TYPES = new Set(["move", "hack", "capture", "wait"]);
+const PLAYER_ORDER = ["gpt", "claude"];
+const PLAYER_TEMPLATES = {
+  gpt: {
+    id: "gpt",
+    label: "GPT",
+    color: "#00f5ff",
+    accent: "#7df9ff",
+    start: { x: 0, y: 0 }
+  },
+  claude: {
+    id: "claude",
+    label: "Claude",
+    color: "#ff4fd8",
+    accent: "#ff9bf0",
+    start: { x: 11, y: 11 }
+  }
+};
+const WALLS = [
+  [3, 3], [3, 4], [4, 3],
+  [8, 8], [8, 7], [7, 8],
+  [5, 5], [6, 5], [5, 6], [6, 6],
+  [1, 8], [10, 3]
+];
+const NODE_POSITIONS = [
+  { id: "n1", x: 2, y: 2 },
+  { id: "n2", x: 9, y: 2 },
+  { id: "n3", x: 2, y: 9 },
+  { id: "n4", x: 9, y: 9 }
+];
+
+let state = createInitialState();
+
+function createInitialState() {
+  const players = {};
+  for (const id of PLAYER_ORDER) {
+    const template = PLAYER_TEMPLATES[id];
+    players[id] = {
+      id: template.id,
+      label: template.label,
+      color: template.color,
+      accent: template.accent,
+      start: { ...template.start },
+      pos: { ...template.start },
+      hp: 3,
+      maxHp: 3,
+      respawnIn: 0,
+      capturedNodes: 0,
+      alive: true,
+      lastAction: null
+    };
+  }
+
+  const nodes = NODE_POSITIONS.map((node) => ({ ...node, owner: null }));
+
+  return {
+    turn: 1,
+    maxTurns: MAX_TURNS,
+    phase: "waiting_for_actions",
+    winnerIds: [],
+    grid: {
+      width: 12,
+      height: 12,
+      walls: WALLS.map(([x, y]) => [x, y])
+    },
+    players,
+    nodes,
+    pendingActions: {},
+    log: [
+      {
+        turn: 1,
+        playerId: "system",
+        type: "boot",
+        summary: "NEON GRID initialized"
+      }
+    ]
+  };
+}
+
+function route(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || `localhost:${PORT}`}`);
+
+  if (req.method === "OPTIONS") {
+    return withCors(res, 204).end();
+  }
+
+  if (req.method === "GET" && url.pathname === "/") {
+    return html(res, page());
+  }
+
+  if (req.method === "GET" && url.pathname === "/state") {
+    return json(res, 200, publicState());
+  }
+
+  if ((req.method === "POST" || req.method === "GET") && url.pathname === "/action") {
+    return readBody(req).then((body) => {
+      const input = collectInput(url, body);
+      const result = submitAction(input);
+      return json(res, result.ok ? 200 : result.statusCode, result.body);
+    }).catch((error) => {
+      return json(res, 400, { error: error.message || "Invalid request body" });
+    });
+  }
+
+  if ((req.method === "POST" || req.method === "GET") && url.pathname === "/reset") {
+    state = createInitialState();
+    appendLog({
+      turn: state.turn,
+      playerId: "system",
+      type: "reset",
+      summary: "Match reset"
+    });
+    return json(res, 200, { ok: true, state: publicState() });
+  }
+
+  return json(res, 404, { error: "Not found" });
+}
+
+function publicState() {
+  return {
+    turn: state.turn,
+    maxTurns: state.maxTurns,
+    phase: state.phase,
+    winnerIds: state.winnerIds,
+    grid: state.grid,
+    players: state.players,
+    nodes: state.nodes,
+    pendingActions: state.pendingActions,
+    log: state.log
+  };
+}
+
+function collectInput(url, body) {
+  return {
+    player: body.player || url.searchParams.get("player"),
+    type: body.type || url.searchParams.get("type"),
+    direction: body.direction || body.dir || url.searchParams.get("direction") || url.searchParams.get("dir"),
+    turn: body.turn || url.searchParams.get("turn"),
+    actionId: body.actionId || url.searchParams.get("actionId") || url.searchParams.get("action_id")
+  };
+}
+
+function submitAction(input) {
+  if (state.phase === "game_over") {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: "Game is over. Reset to start a new match." }
+    };
+  }
+
+  const playerId = String(input.player || "");
+  const type = String(input.type || "").toLowerCase();
+  const player = state.players[playerId];
+
+  if (!player) {
+    return { ok: false, statusCode: 400, body: { error: "Unknown player" } };
+  }
+  if (!ACTION_TYPES.has(type)) {
+    return { ok: false, statusCode: 400, body: { error: "Unsupported action type" } };
+  }
+  if (!isActionablePlayer(player)) {
+    return { ok: false, statusCode: 409, body: { error: "Player cannot act this turn" } };
+  }
+
+  const turn = Number(input.turn || state.turn);
+  if (!Number.isInteger(turn) || turn !== state.turn) {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: { error: `Action is for turn ${turn}; current turn is ${state.turn}` }
+    };
+  }
+
+  let direction = null;
+  if (type === "move") {
+    direction = String(input.direction || "").toLowerCase();
+    if (!DIRECTIONS[direction]) {
+      return { ok: false, statusCode: 400, body: { error: "Invalid move direction" } };
+    }
+  }
+
+  const existing = state.pendingActions[playerId];
+  const nextAction = {
+    turn,
+    type,
+    direction,
+    actionId: String(input.actionId || `${playerId}-${turn}-${type}-${direction || "none"}`),
+    submittedAt: new Date().toISOString()
+  };
+
+  if (existing && existing.actionId === nextAction.actionId) {
+    return { ok: true, statusCode: 200, body: { ok: true, deduped: true, state: publicState() } };
+  }
+
+  state.pendingActions[playerId] = nextAction;
+  player.lastAction = nextAction;
+  appendLog({
+    turn: state.turn,
+    playerId,
+    type: "submit_action",
+    summary: `${player.label} locked in ${describeAction(nextAction)}`
+  });
+
+  if (readyToResolve()) {
+    resolveTurn();
+  }
+
+  return { ok: true, statusCode: 200, body: { ok: true, state: publicState() } };
+}
+
+function readyToResolve() {
+  const actionableIds = getActionablePlayerIds();
+  return actionableIds.length > 0 && actionableIds.every((id) => Boolean(state.pendingActions[id]));
+}
+
+function getActionablePlayerIds() {
+  return PLAYER_ORDER.filter((id) => isActionablePlayer(state.players[id]));
+}
+
+function isActionablePlayer(player) {
+  return player && player.alive && player.respawnIn === 0;
+}
+
+function resolveTurn() {
+  state.phase = "resolving";
+  const turn = state.turn;
+  const actions = {};
+  const actionableIds = getActionablePlayerIds();
+  const deadAtStart = new Set(
+    PLAYER_ORDER.filter((id) => !state.players[id].alive && state.players[id].respawnIn > 0)
+  );
+
+  for (const id of actionableIds) {
+    actions[id] = state.pendingActions[id] || defaultAction(id);
+  }
+
+  resolveMoves(turn, actions, actionableIds);
+  resolveCaptures(turn, actions, actionableIds);
+  resolveHacks(turn, actions, actionableIds);
+  tickRespawns(turn, deadAtStart);
+  updateCapturedNodeCounts();
+
+  state.pendingActions = {};
+
+  if (turn >= state.maxTurns) {
+    finishGame();
+    return;
+  }
+
+  state.turn += 1;
+  state.phase = "waiting_for_actions";
+  advanceRespawnOnlyTurns();
+}
+
+function resolveMoves(turn, actions, actionableIds) {
+  const attempted = {};
+  const current = {};
+  const blocked = new Set();
+  const destinationCounts = new Map();
+
+  for (const id of actionableIds) {
+    current[id] = { ...state.players[id].pos };
+    const action = actions[id];
+    if (action.type !== "move") continue;
+    const vector = DIRECTIONS[action.direction];
+    const target = {
+      x: current[id].x + vector.x,
+      y: current[id].y + vector.y
+    };
+    if (!isWalkable(target)) {
+      blocked.add(id);
+      appendLog({
+        turn,
+        playerId: id,
+        type: "blocked_move",
+        summary: `${state.players[id].label} tried to move ${vector.label} into a wall`
+      });
+      continue;
+    }
+    attempted[id] = target;
+    const key = posKey(target);
+    destinationCounts.set(key, (destinationCounts.get(key) || 0) + 1);
+  }
+
+  for (const [id, target] of Object.entries(attempted)) {
+    if (destinationCounts.get(posKey(target)) > 1) {
+      blocked.add(id);
+    }
+  }
+
+  for (let i = 0; i < actionableIds.length; i++) {
+    for (let j = i + 1; j < actionableIds.length; j++) {
+      const a = actionableIds[i];
+      const b = actionableIds[j];
+      if (!attempted[a] || !attempted[b]) continue;
+      if (samePos(attempted[a], current[b]) && samePos(attempted[b], current[a])) {
+        blocked.add(a);
+        blocked.add(b);
+      }
+    }
+  }
+
+  for (const [id, target] of Object.entries(attempted)) {
+    if (blocked.has(id)) {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "move_cancelled",
+        summary: `${state.players[id].label}'s move was cancelled by a collision`
+      });
+      continue;
+    }
+    state.players[id].pos = target;
+    appendLog({
+      turn,
+      playerId: id,
+      type: "move",
+      summary: `${state.players[id].label} moved ${DIRECTIONS[actions[id].direction].label}`
+    });
+  }
+
+  for (const id of actionableIds) {
+    if (actions[id].type === "wait") {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "wait",
+        summary: `${state.players[id].label} held position`
+      });
+    }
+  }
+}
+
+function resolveCaptures(turn, actions, actionableIds) {
+  for (const id of actionableIds) {
+    const action = actions[id];
+    if (action.type !== "capture") continue;
+    const player = state.players[id];
+    const node = state.nodes.find((entry) => samePos(entry, player.pos));
+    if (!node) {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "capture_failed",
+        summary: `${player.label} tried to capture empty ground`
+      });
+      continue;
+    }
+    if (node.owner === id) {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "capture_hold",
+        summary: `${player.label} reinforced node ${node.id}`
+      });
+      continue;
+    }
+    node.owner = id;
+    appendLog({
+      turn,
+      playerId: id,
+      type: "capture",
+      summary: `${player.label} captured node ${node.id}`
+    });
+  }
+}
+
+function resolveHacks(turn, actions, actionableIds) {
+  const damage = {};
+
+  for (const id of actionableIds) {
+    const action = actions[id];
+    if (action.type !== "hack") continue;
+    const player = state.players[id];
+    const targets = actionableIds.filter((otherId) => {
+      if (otherId === id) return false;
+      const other = state.players[otherId];
+      return other.alive && manhattan(player.pos, other.pos) === 1;
+    });
+
+    if (targets.length === 0) {
+      appendLog({
+        turn,
+        playerId: id,
+        type: "hack_whiff",
+        summary: `${player.label} hacked empty air`
+      });
+      continue;
+    }
+
+    for (const targetId of targets) {
+      damage[targetId] = (damage[targetId] || 0) + 1;
+      appendLog({
+        turn,
+        playerId: id,
+        type: "hack",
+        summary: `${player.label} hacked ${state.players[targetId].label}`
+      });
+    }
+  }
+
+  for (const [targetId, amount] of Object.entries(damage)) {
+    const player = state.players[targetId];
+    player.hp -= amount;
+    appendLog({
+      turn,
+      playerId: targetId,
+      type: "damage",
+      summary: `${player.label} took ${amount} damage`
+    });
+    if (player.hp <= 0) {
+      player.hp = 0;
+      player.alive = false;
+      player.respawnIn = 1;
+      appendLog({
+        turn,
+        playerId: targetId,
+        type: "flatline",
+        summary: `${player.label} flatlined and will respawn in 1 turn`
+      });
+    }
+  }
+}
+
+function tickRespawns(turn, deadAtStart) {
+  for (const id of deadAtStart) {
+    const player = state.players[id];
+    player.respawnIn = Math.max(0, player.respawnIn - 1);
+    if (player.respawnIn === 0) {
+      respawnPlayer(turn, player);
+    }
+  }
+}
+
+function advanceRespawnOnlyTurns() {
+  while (state.phase !== "game_over" && getActionablePlayerIds().length === 0) {
+    const waiting = PLAYER_ORDER.filter((id) => !state.players[id].alive && state.players[id].respawnIn > 0);
+    if (waiting.length === 0) break;
+
+    appendLog({
+      turn: state.turn,
+      playerId: "system",
+      type: "cooldown_turn",
+      summary: `Turn ${state.turn} skipped while operators were respawning`
+    });
+
+    for (const id of waiting) {
+      const player = state.players[id];
+      player.respawnIn = Math.max(0, player.respawnIn - 1);
+      if (player.respawnIn === 0) {
+        respawnPlayer(state.turn, player);
+      }
+    }
+
+    if (state.turn >= state.maxTurns) {
+      finishGame();
+      return;
+    }
+
+    state.turn += 1;
+  }
+}
+
+function respawnPlayer(turn, player) {
+  player.alive = true;
+  player.hp = player.maxHp;
+  player.pos = findSpawn(player.start);
+  appendLog({
+    turn,
+    playerId: player.id,
+    type: "respawn",
+    summary: `${player.label} respawned`
+  });
+}
+
+function findSpawn(preferred) {
+  if (isWalkable(preferred) && !isOccupied(preferred)) {
+    return { ...preferred };
+  }
+
+  for (let radius = 1; radius <= 12; radius++) {
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const candidate = { x: preferred.x + dx, y: preferred.y + dy };
+        if (!isWalkable(candidate) || isOccupied(candidate)) continue;
+        return candidate;
+      }
+    }
+  }
+
+  return { ...preferred };
+}
+
+function finishGame() {
+  updateCapturedNodeCounts();
+  const scores = PLAYER_ORDER.map((id) => state.players[id].capturedNodes);
+  const best = Math.max(...scores);
+  state.winnerIds = PLAYER_ORDER.filter((id) => state.players[id].capturedNodes === best);
+  state.phase = "game_over";
+  appendLog({
+    turn: state.turn,
+    playerId: "system",
+    type: "game_over",
+    summary: state.winnerIds.length === 1
+      ? `${state.players[state.winnerIds[0]].label} wins the grid`
+      : "The grid ended in a draw"
+  });
+}
+
+function updateCapturedNodeCounts() {
+  for (const id of PLAYER_ORDER) {
+    state.players[id].capturedNodes = state.nodes.filter((node) => node.owner === id).length;
+  }
+}
+
+function defaultAction(playerId) {
+  return {
+    turn: state.turn,
+    type: "wait",
+    direction: null,
+    actionId: `${playerId}-${state.turn}-wait`,
+    submittedAt: new Date().toISOString()
+  };
+}
+
+function appendLog(entry) {
+  state.log.push(entry);
+  if (state.log.length > MAX_LOG_ENTRIES) {
+    state.log.splice(0, state.log.length - MAX_LOG_ENTRIES);
+  }
+}
+
+function describeAction(action) {
+  if (action.type === "move") {
+    return `MOVE ${action.direction}`;
+  }
+  return action.type.toUpperCase();
+}
+
+function isWalkable(pos) {
+  return inBounds(pos) && !isWall(pos);
+}
+
+function inBounds(pos) {
+  return pos.x >= 0 && pos.y >= 0 && pos.x < state.grid.width && pos.y < state.grid.height;
+}
+
+function isWall(pos) {
+  return state.grid.walls.some(([x, y]) => x === pos.x && y === pos.y);
+}
+
+function isOccupied(pos) {
+  return PLAYER_ORDER.some((id) => {
+    const player = state.players[id];
+    return player.alive && samePos(player.pos, pos);
+  });
+}
+
+function samePos(a, b) {
+  return a.x === b.x && a.y === b.y;
+}
+
+function posKey(pos) {
+  return `${pos.x},${pos.y}`;
+}
+
+function manhattan(a, b) {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+
+function withCors(res, statusCode) {
+  res.writeHead(statusCode, {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  });
+  return res;
+}
 
 function json(res, statusCode, data) {
+  const body = JSON.stringify(data, null, 2);
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
   });
-  res.end(JSON.stringify(data, null, 2));
+  res.end(body);
 }
 
 function html(res, body) {
@@ -68,8 +609,27 @@ function html(res, body) {
   res.end(body);
 }
 
-function notFound(res) {
-  json(res, 404, { error: "Not found" });
+function readBody(req) {
+  if (req.method !== "POST") return Promise.resolve({});
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > 100_000) {
+        reject(new Error("Request body too large"));
+      }
+    });
+    req.on("end", () => {
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error("Expected JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 function page() {
@@ -82,221 +642,390 @@ function page() {
     <style>
       :root {
         --bg: #060812;
-        --panel: #0e1424;
+        --panel: rgba(12, 18, 34, 0.92);
+        --panel-border: rgba(130, 154, 219, 0.16);
         --grid: #10192d;
-        --line: #1d2b4f;
+        --line: rgba(64, 88, 142, 0.65);
         --cyan: #00f5ff;
+        --cyan-soft: rgba(0, 245, 255, 0.18);
         --magenta: #ff4fd8;
+        --magenta-soft: rgba(255, 79, 216, 0.18);
         --green: #5cff87;
+        --amber: #ffd166;
+        --red: #ff5c7a;
         --text: #d7e4ff;
-        --muted: #7d8eb8;
+        --muted: #91a0c7;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
-        font-family: ui-sans-serif, system-ui, sans-serif;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
         color: var(--text);
         background:
-          radial-gradient(circle at top, rgba(255,79,216,0.12), transparent 30%),
-          radial-gradient(circle at bottom right, rgba(0,245,255,0.14), transparent 30%),
-          var(--bg);
+          radial-gradient(circle at top, rgba(255,79,216,0.15), transparent 30%),
+          radial-gradient(circle at right, rgba(0,245,255,0.12), transparent 28%),
+          linear-gradient(180deg, #060812 0%, #080d18 100%);
       }
       main {
-        max-width: 1100px;
+        max-width: 1240px;
         margin: 0 auto;
-        padding: 32px 20px 48px;
+        padding: 28px 18px 48px;
       }
-      h1 {
-        margin: 0 0 8px;
-        font-size: clamp(2rem, 5vw, 3.5rem);
+      .hero {
+        display: flex;
+        justify-content: space-between;
+        gap: 18px;
+        align-items: end;
+        margin-bottom: 22px;
+      }
+      .hero h1 {
+        margin: 0;
+        font-size: clamp(2.4rem, 7vw, 4.8rem);
+        line-height: 0.92;
         letter-spacing: 0.08em;
+        text-transform: uppercase;
       }
-      p { color: var(--muted); }
+      .hero p {
+        margin: 10px 0 0;
+        max-width: 720px;
+        color: var(--muted);
+        font-size: 1rem;
+      }
+      .chipbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      .chip {
+        border: 1px solid var(--panel-border);
+        background: rgba(10, 15, 26, 0.85);
+        border-radius: 999px;
+        padding: 8px 12px;
+        font-size: 0.86rem;
+        color: var(--muted);
+      }
       .layout {
         display: grid;
-        grid-template-columns: minmax(320px, 1.3fr) minmax(280px, 0.9fr);
-        gap: 20px;
+        grid-template-columns: minmax(340px, 1.1fr) minmax(320px, 0.9fr);
+        gap: 18px;
       }
       .panel {
-        background: rgba(14,20,36,0.88);
-        border: 1px solid rgba(125,142,184,0.18);
-        border-radius: 18px;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 20px;
+        overflow: hidden;
+        box-shadow: 0 24px 70px rgba(0, 0, 0, 0.25);
+      }
+      .panel-head {
+        padding: 16px 18px 0;
+        font-size: 0.78rem;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .panel-body {
         padding: 18px;
-        backdrop-filter: blur(12px);
       }
       canvas {
         width: 100%;
         aspect-ratio: 1;
         display: block;
-        background: var(--grid);
-        border-radius: 12px;
+        border-radius: 16px;
+        background: linear-gradient(180deg, #0d1527 0%, #0a1221 100%);
       }
-      .meta, .actions {
+      .stack {
         display: grid;
-        gap: 12px;
+        gap: 14px;
       }
-      .actions button {
+      .stats {
+        display: grid;
+        gap: 10px;
+      }
+      .player-card {
+        border: 1px solid var(--panel-border);
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(10, 15, 26, 0.8);
+      }
+      .player-card strong {
+        display: inline-block;
+        margin-bottom: 4px;
+      }
+      .actions {
+        display: grid;
+        gap: 14px;
+      }
+      .action-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+      }
+      button {
         border: 0;
-        border-radius: 10px;
-        padding: 12px 14px;
+        border-radius: 12px;
+        padding: 11px 10px;
         font: inherit;
-        color: #08111f;
-        background: linear-gradient(135deg, var(--cyan), #8cf8ff);
         cursor: pointer;
+        color: #08111f;
+        background: linear-gradient(135deg, #82f9ff, var(--cyan));
+      }
+      button.alt {
+        background: linear-gradient(135deg, #ffd6fa, var(--magenta));
+      }
+      button.secondary {
+        background: linear-gradient(135deg, #d4ffe0, var(--green));
+      }
+      button.ghost {
+        background: rgba(17, 27, 47, 0.9);
+        border: 1px solid var(--panel-border);
+        color: var(--text);
+      }
+      .log {
+        display: grid;
+        gap: 8px;
+        max-height: 320px;
+        overflow: auto;
+      }
+      .log-entry {
+        border-left: 3px solid rgba(130, 154, 219, 0.24);
+        padding-left: 10px;
+        color: var(--muted);
+        font-size: 0.94rem;
+      }
+      .status {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+      .status span {
+        background: rgba(10, 15, 26, 0.84);
+        border: 1px solid var(--panel-border);
+        border-radius: 999px;
+        padding: 7px 11px;
+        color: var(--muted);
+        font-size: 0.84rem;
       }
       pre {
         margin: 0;
         white-space: pre-wrap;
+        font-size: 0.76rem;
+        line-height: 1.45;
         color: var(--muted);
       }
-      @media (max-width: 900px) {
+      @media (max-width: 980px) {
+        .hero { flex-direction: column; align-items: start; }
         .layout { grid-template-columns: 1fr; }
       }
     </style>
   </head>
   <body>
     <main>
-      <h1>NEON GRID</h1>
-      <p>Agent-first turn-based cyberpunk tactics. This is the public scaffold for co-creation.</p>
-      <div class="layout">
-        <section class="panel">
-          <canvas id="board" width="720" height="720"></canvas>
-        </section>
-        <section class="panel">
-          <div class="meta">
-            <div id="summary"></div>
-            <div class="actions">
-              <button data-player="gpt" data-type="wait">Submit WAIT for GPT</button>
-              <button data-player="claude" data-type="wait">Submit WAIT for Claude</button>
-            </div>
-            <pre id="dump"></pre>
+      <section class="hero">
+        <div>
+          <h1>Neon Grid</h1>
+          <p>Agent-first cyberpunk tactics. Bots can read <code>/state</code>, submit to <code>/action</code>, and battle on a deterministic turn barrier.</p>
+        </div>
+        <div class="chipbar">
+          <span class="chip">Node built-ins only</span>
+          <span class="chip">Simultaneous turns</span>
+          <span class="chip">HTTP-native control</span>
+        </div>
+      </section>
+
+      <section class="layout">
+        <article class="panel">
+          <div class="panel-head">Arena</div>
+          <div class="panel-body">
+            <div class="status" id="status"></div>
+            <canvas id="board" width="720" height="720"></canvas>
           </div>
-        </section>
-      </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">Operations</div>
+          <div class="panel-body stack">
+            <div class="stats" id="players"></div>
+            <div class="actions" id="controls"></div>
+            <button class="ghost" id="reset">Reset Match</button>
+            <div class="log" id="log"></div>
+            <details>
+              <summary>Raw state</summary>
+              <pre id="dump"></pre>
+            </details>
+          </div>
+        </article>
+      </section>
     </main>
     <script>
       const canvas = document.getElementById("board");
       const ctx = canvas.getContext("2d");
-      const summary = document.getElementById("summary");
-      const dump = document.getElementById("dump");
-      const cell = canvas.width / 12;
+      const statusEl = document.getElementById("status");
+      const playersEl = document.getElementById("players");
+      const controlsEl = document.getElementById("controls");
+      const logEl = document.getElementById("log");
+      const dumpEl = document.getElementById("dump");
+      const resetEl = document.getElementById("reset");
+      let lastState = null;
 
-      async function fetchState() {
-        const res = await fetch("/state");
-        return res.json();
+      async function api(path, options) {
+        const response = await fetch(path, options);
+        return response.json();
       }
 
-      function drawGrid(state) {
+      function cell(state) {
+        return canvas.width / state.grid.width;
+      }
+
+      function draw(state) {
+        const size = cell(state);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = "#10192d";
+        ctx.fillStyle = "#0c1526";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        ctx.strokeStyle = "#1d2b4f";
+        ctx.strokeStyle = "rgba(80,102,151,0.38)";
         ctx.lineWidth = 1;
-        for (let i = 0; i <= state.grid.width; i++) {
-          const x = i * cell;
+        for (let x = 0; x <= state.grid.width; x++) {
           ctx.beginPath();
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, canvas.height);
+          ctx.moveTo(x * size, 0);
+          ctx.lineTo(x * size, canvas.height);
           ctx.stroke();
         }
-        for (let i = 0; i <= state.grid.height; i++) {
-          const y = i * cell;
+        for (let y = 0; y <= state.grid.height; y++) {
           ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(canvas.width, y);
+          ctx.moveTo(0, y * size);
+          ctx.lineTo(canvas.width, y * size);
           ctx.stroke();
         }
 
-        ctx.fillStyle = "#243456";
+        ctx.fillStyle = "#253455";
         for (const [x, y] of state.grid.walls) {
-          ctx.fillRect(x * cell + 4, y * cell + 4, cell - 8, cell - 8);
+          ctx.fillRect(x * size + 4, y * size + 4, size - 8, size - 8);
         }
 
         for (const node of state.nodes) {
-          ctx.fillStyle = node.owner ? "#5cff87" : "#ffe66d";
+          const owner = node.owner ? state.players[node.owner] : null;
+          ctx.fillStyle = owner ? owner.color : "#ffd166";
           ctx.beginPath();
-          ctx.arc(node.x * cell + cell / 2, node.y * cell + cell / 2, cell * 0.22, 0, Math.PI * 2);
+          ctx.arc(node.x * size + size / 2, node.y * size + size / 2, size * 0.22, 0, Math.PI * 2);
           ctx.fill();
+          ctx.strokeStyle = owner ? owner.accent : "rgba(255,209,102,0.45)";
+          ctx.lineWidth = 3;
+          ctx.stroke();
         }
 
         for (const player of Object.values(state.players)) {
+          ctx.globalAlpha = player.alive ? 1 : 0.35;
           ctx.fillStyle = player.color;
-          ctx.fillRect(player.pos.x * cell + 10, player.pos.y * cell + 10, cell - 20, cell - 20);
+          ctx.fillRect(player.pos.x * size + 10, player.pos.y * size + 10, size - 20, size - 20);
+          ctx.strokeStyle = player.accent;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(player.pos.x * size + 10, player.pos.y * size + 10, size - 20, size - 20);
         }
+        ctx.globalAlpha = 1;
+      }
+
+      function renderStatus(state) {
+        const pendingCount = Object.keys(state.pendingActions).length;
+        const winners = state.winnerIds.length ? "Winner: " + state.winnerIds.map((id) => state.players[id].label).join(", ") : "Winner: pending";
+        statusEl.innerHTML = [
+          "<span>Turn " + state.turn + " / " + state.maxTurns + "</span>",
+          "<span>Phase: " + state.phase + "</span>",
+          "<span>Pending actions: " + pendingCount + "</span>",
+          "<span>" + winners + "</span>"
+        ].join("");
+      }
+
+      function renderPlayers(state) {
+        playersEl.innerHTML = Object.values(state.players).map((player) => {
+          const pending = state.pendingActions[player.id];
+          return "<div class=\\"player-card\\">" +
+            "<strong style=\\"color:" + player.color + "\\">" + player.label + "</strong><br>" +
+            "Pos: (" + player.pos.x + ", " + player.pos.y + ")<br>" +
+            "HP: " + player.hp + " / " + player.maxHp + "<br>" +
+            "Nodes: " + player.capturedNodes + "<br>" +
+            "Respawn: " + player.respawnIn + "<br>" +
+            "Status: " + (player.alive ? "Online" : "Offline") + "<br>" +
+            "Queued: " + (pending ? pending.type + (pending.direction ? " " + pending.direction : "") : "none") +
+          "</div>";
+        }).join("");
+      }
+
+      function actionButton(playerId, label, payload, className) {
+        return "<button class=\\"" + className + "\\" data-player=\\"" + playerId + "\\" data-payload='" + JSON.stringify(payload) + "'>" + label + "</button>";
+      }
+
+      function renderControls(state) {
+        controlsEl.innerHTML = Object.values(state.players).map((player) => {
+          return "<section>" +
+            "<strong style=\\"color:" + player.color + "\\">" + player.label + "</strong>" +
+            "<div class=\\"action-grid\\">" +
+              actionButton(player.id, "North", { type: "move", direction: "north" }, player.id === "claude" ? "alt" : "") +
+              actionButton(player.id, "Hack", { type: "hack" }, "secondary") +
+              actionButton(player.id, "East", { type: "move", direction: "east" }, player.id === "claude" ? "alt" : "") +
+              actionButton(player.id, "West", { type: "move", direction: "west" }, player.id === "claude" ? "alt" : "") +
+              actionButton(player.id, "Capture", { type: "capture" }, "secondary") +
+              actionButton(player.id, "South", { type: "move", direction: "south" }, player.id === "claude" ? "alt" : "") +
+              actionButton(player.id, "Wait", { type: "wait" }, "ghost") +
+            "</div>" +
+          "</section>";
+        }).join("");
+
+        controlsEl.querySelectorAll("button").forEach((button) => {
+          button.addEventListener("click", async () => {
+            const payload = JSON.parse(button.dataset.payload);
+            payload.player = button.dataset.player;
+            payload.turn = lastState.turn;
+            await api("/action", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload)
+            });
+            await refresh();
+          });
+        });
+      }
+
+      function renderLog(state) {
+        logEl.innerHTML = state.log.slice().reverse().map((entry) => {
+          return "<div class=\\"log-entry\\"><strong>T" + entry.turn + "</strong> " + entry.summary + "</div>";
+        }).join("");
       }
 
       async function refresh() {
-        const state = await fetchState();
-        summary.innerHTML = "<strong>Turn " + state.turn + "</strong><br>Phase: " + state.phase;
-        dump.textContent = JSON.stringify(state, null, 2);
-        drawGrid(state);
+        const state = await api("/state");
+        lastState = state;
+        renderStatus(state);
+        renderPlayers(state);
+        renderControls(state);
+        renderLog(state);
+        dumpEl.textContent = JSON.stringify(state, null, 2);
+        draw(state);
       }
 
-      document.querySelectorAll("button").forEach((button) => {
-        button.addEventListener("click", async () => {
-          const params = new URLSearchParams({
-            player: button.dataset.player,
-            type: button.dataset.type
-          });
-          await fetch("/action?" + params.toString(), { method: "POST" });
-          refresh();
-        });
+      resetEl.addEventListener("click", async () => {
+        await api("/reset", { method: "POST" });
+        await refresh();
       });
 
       refresh();
-      setInterval(refresh, 2000);
+      setInterval(refresh, 1500);
     </script>
   </body>
 </html>`;
 }
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, "http://localhost:3000");
+const server = http.createServer(route);
 
-  if (req.method === "GET" && url.pathname === "/") {
-    return html(res, page());
-  }
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log("NEON GRID listening on http://localhost:" + PORT);
+  });
+}
 
-  if (req.method === "GET" && url.pathname === "/state") {
-    return json(res, 200, state);
-  }
-
-  if (req.method === "POST" && url.pathname === "/action") {
-    const player = url.searchParams.get("player");
-    const type = url.searchParams.get("type");
-    if (!player || !state.players[player]) {
-      return json(res, 400, { error: "Unknown player" });
-    }
-    if (!type) {
-      return json(res, 400, { error: "Missing action type" });
-    }
-    state.pendingActions[player] = { type };
-    state.log.push({
-      turn: state.turn,
-      playerId: player,
-      type: "submit_action",
-      summary: player + " submitted " + type
-    });
-    return json(res, 200, { ok: true, pendingActions: state.pendingActions });
-  }
-
-  if (req.method === "POST" && url.pathname === "/reset") {
-    state.turn = 1;
-    state.phase = "waiting_for_actions";
-    state.pendingActions = {};
-    state.log.push({
-      turn: state.turn,
-      playerId: "system",
-      type: "reset",
-      summary: "Match reset requested"
-    });
-    return json(res, 200, { ok: true });
-  }
-
-  return notFound(res);
-});
-
-server.listen(3000, () => {
-  console.log("NEON GRID listening on http://localhost:3000");
-});
+module.exports = {
+  server,
+  createInitialState,
+  submitAction,
+  publicState
+};

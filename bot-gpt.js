@@ -10,6 +10,7 @@ const DIRS = [
 ];
 
 let lastSubmittedTurn = 0;
+let lastSeenTurn = 0;
 
 function key(pos) {
   return `${pos.x},${pos.y}`;
@@ -110,6 +111,10 @@ async function tick() {
   const state = await request("/state");
   const me = state.players[playerId];
   if (!me) throw new Error(`Unknown player ${playerId}`);
+  if (state.turn < lastSeenTurn) {
+    lastSubmittedTurn = 0;
+  }
+  lastSeenTurn = state.turn;
   if (state.phase !== "waiting_for_actions") return;
   if (!me.alive || me.respawnIn > 0) return;
   if (state.pendingActions[playerId]) return;
